@@ -361,12 +361,15 @@
               <option value="5">Beam Width = 5</option>
               <option value="10">Beam Width = 10</option>
             </select>
-            <select class="select-styled" id="depthLimitSel" style="display:none">
-              <option value="5">Depth Limit = 5</option>
-              <option value="8">Depth Limit = 8</option>
-              <option value="10">Depth Limit = 10</option>
-              <option value="15">Depth Limit = 15</option>
-            </select>
+            <div style="margin-bottom:6px; font-size:10px; color:var(--text2);">Depth Limit: 5, 8, 10, 15 atau ketik angka custom</div>
+            <input class="select-styled" id="depthLimitSel" type="number" list="depthLimitOptions" min="1" step="1" placeholder="Masukkan depth limit" style="display:none; appearance:none; -webkit-appearance:none; -moz-appearance:textfield;" oninput="clearDepthLimitValidationError()">
+            <datalist id="depthLimitOptions">
+              <option value="5"></option>
+              <option value="8"></option>
+              <option value="10"></option>
+              <option value="15"></option>
+            </datalist>
+            <span id="depthLimitError" style="display:none; color:var(--accent5); font-size:0.85rem;">Masukkan angka positif.</span>
           </div>
           <div class="panel-section" style="flex:1;overflow-y:auto;padding-bottom:6px;">
             <div class="panel-title">Informasi Langkah</div>

@@ -518,6 +518,21 @@ button:disabled, select:disabled {
   50%      { box-shadow:0 0 18px rgba(251,191,36,0.6), 0 0 30px rgba(248,113,113,0.2); }
 }
 
+#depthCustomInput {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: textfield;
+}
+#depthCustomInput::-webkit-inner-spin-button,
+#depthCustomInput::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+#depthCustomInput::-moz-inner-spin-button,
+#depthCustomInput::-moz-outer-spin-button {
+  appearance: none;
+}
+
 /* Generator mode badge */
 .gen-badge {
   display:inline-flex; align-items:center; gap:3px;
@@ -558,6 +573,20 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:13px; h
   transition:border-color 0.15s;
 }
 .select-styled:focus { border-color:var(--accent); }
+#depthLimitSel {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: textfield;
+}
+#depthLimitSel::-webkit-inner-spin-button,
+#depthLimitSel::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+#depthLimitSel::-moz-inner-spin-button,
+#depthLimitSel::-moz-outer-spin-button {
+  appearance: none;
+}
 
 /* ── INFO ROWS ── */
 .info-row {

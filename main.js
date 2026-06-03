@@ -753,10 +753,37 @@ function handleWorkerMessage(e) {
   vqEnqueue(e.data);
 }
 
+// Ambil nilai Depth Limit untuk DLS dari field tunggal dan jalankan validasi angka positif.
+function getDepthLimitValue() {
+  const input = document.getElementById('depthLimitSel');
+  if (!input) return 10;
+  const raw = input.value.trim();
+  const depth = parseInt(raw, 10);
+  if (!raw || Number.isNaN(depth) || depth <= 0) {
+    setDepthLimitValidationError('Masukkan angka positif untuk Depth Limit.');
+    return null;
+  }
+  clearDepthLimitValidationError();
+  return depth;
+}
+
+function setDepthLimitValidationError(message) {
+  const errorEl = document.getElementById('depthLimitError');
+  if (!errorEl) return;
+  errorEl.textContent = message;
+  errorEl.style.display = 'block';
+}
+
+function clearDepthLimitValidationError() {
+  const errorEl = document.getElementById('depthLimitError');
+  if (!errorEl) return;
+  errorEl.style.display = 'none';
+}
+
 function sendGridToWorker() {
   const weightVal = parseFloat(document.getElementById('weightSel')?.value ?? '1') || 1.0;
   const beamVal = parseInt(document.getElementById('beamWidthSel')?.value ?? '3') || 3;
-  const depthVal = parseInt(document.getElementById('depthLimitSel')?.value ?? '10') || 10;
+  const depthVal = getDepthLimitValue() ?? 10;
   if (currentAlgo === 'weighted_astar') {
     consoleLog('info', `Weighted A* — bobot w=${weightVal}`);
   }
@@ -812,6 +839,13 @@ function resetGridState() {
 function startSimulation() {
   if (!startPos || !goalPos) { consoleLog('error', 'Start/Goal belum ditentukan!'); return; }
   if (isRunning && !isPaused) return;
+  if (currentAlgo === 'dls') {
+    const depthLimit = getDepthLimitValue();
+    if (depthLimit === null) {
+      consoleLog('error', 'Depth Limit tidak valid. Masukkan angka positif.');
+      return;
+    }
+  }
 
   // Resume dari jeda
   if (isPaused) {
@@ -879,7 +913,7 @@ function initAlgorithm() {
       break;
     case 'dls':
       algoState.stack = [{ r: s.r, c: s.c, depth: 0 }];
-      algoState.depthLimit = parseInt(document.getElementById('depthLimitSel').value) || 10;
+      algoState.depthLimit = getDepthLimitValue() || 10;
       break;
     case 'ids':
       algoState.maxDepth = 0; algoState.currentDepth = 0;
@@ -3542,7 +3576,7 @@ function _initCmpAlgo(algo, s, g) {
       as.stack.push({ r: s.r, c: s.c });
       break;
     case 'dls':
-      as.depthLimit = parseInt(document.getElementById('depthLimitSel').value) || 10;
+      as.depthLimit = getDepthLimitValue() || 10;
       as.stack.push({ r: s.r, c: s.c, depth: 0 });
       break;
     case 'ids':
