@@ -1164,24 +1164,33 @@ function* gen_AlphaBeta(s, g) {
 }
 
 function* gen_MCTS(s, g) {
-  const MAX_ITER = 300;
-  const root = { r: s.r, c: s.c, parentNode: null, children: [], visits: 0, wins: 0 };
+  const MAX_ITER = 3000;
+  const root = { r: s.r, c: s.c, parentNode: null, children: null, visits: 0, wins: 0 };
 
   for (let iter = 0; iter < MAX_ITER; iter++) {
     stepCount++;
 
-    // Selection via UCB1
+    // 1. Selection
     let node = root;
-    while (node.children.length > 0 && node.children.every(ch => ch.visits > 0)) {
-      let bestUcb = -Infinity, nextNode = null;
-      for (const ch of node.children) {
-        const ucb = (ch.wins / ch.visits) + 1.41 * Math.sqrt(Math.log(node.visits) / ch.visits);
-        if (ucb > bestUcb) { bestUcb = ucb; nextNode = ch; }
+    while (node.children !== null) {
+      const unvisited = node.children.filter(ch => ch.visits === 0);
+      if (unvisited.length > 0) {
+        node = unvisited[Math.floor(Math.random() * unvisited.length)];
+        break; 
+      } else if (node.children.length === 0) {
+        break; 
+      } else {
+        let bestUcb = -Infinity, nextNode = null;
+        for (const ch of node.children) {
+          const ucb = (ch.wins / ch.visits) + 2.0 * Math.sqrt(Math.log(node.visits) / ch.visits);
+          if (ucb > bestUcb) { bestUcb = ucb; nextNode = ch; }
+        }
+        node = nextNode;
       }
-      node = nextNode || node.children[0];
     }
 
     markCurrent(node.r, node.c); markVisited(node.r, node.c);
+    
     if (node.r === g.r && node.c === g.c) {
       const pm = {};
       let c2 = node;
@@ -1190,36 +1199,82 @@ function* gen_MCTS(s, g) {
       return 'DONE';
     }
 
-    // Expansion
-    if (node.visits > 0 || node === root) {
+    // 2. Expansion
+    if (node.visits > 0 && node.children === null) {
       let anc = node;
       const pathSet = new Set();
       while (anc) { pathSet.add(key(anc.r, anc.c)); anc = anc.parentNode; }
-      node.children = getNeighbors(node.r, node.c)
-        .filter(n => !pathSet.has(key(n.r, n.c)))
-        .map(n => ({ ...n, parentNode: node, children: [], visits: 0, wins: 0 }));
+      
+      const nbrs = getNeighbors(node.r, node.c).filter(n => !pathSet.has(key(n.r, n.c)));
+      node.children = nbrs.map(n => {
+        markQueued(n.r, n.c);
+        return { ...n, parentNode: node, children: null, visits: 0, wins: 0 };
+      });
+      
+      if (node.children.length > 0) {
+        node = node.children[Math.floor(Math.random() * node.children.length)];
+        markCurrent(node.r, node.c); markVisited(node.r, node.c);
+        if (node.r === g.r && node.c === g.c) {
+           const pm = {};
+           let c2 = node;
+           while (c2.parentNode) { pm[key(c2.r, c2.c)] = key(c2.parentNode.r, c2.parentNode.c); c2 = c2.parentNode; }
+           emitPath(tracePathMap(pm, node.r, node.c));
+           return 'DONE';
+        }
+      }
     }
 
-    // Simulation
+    // 3. Simulation (Rollout)
     let sr = node.r, sc = node.c;
-    const simVis = new Set([key(sr, sc)]);
-    for (let i = 0; i < 40; i++) {
+    const simVis = new Set();
+    let anc2 = node;
+    while (anc2) { simVis.add(key(anc2.r, anc2.c)); anc2 = anc2.parentNode; }
+    
+    let simDepth = 0;
+    while (simDepth < 30) {
       if (sr === g.r && sc === g.c) break;
       const nbrs = getNeighbors(sr, sc).filter(n => !simVis.has(key(n.r, n.c)));
       if (!nbrs.length) break;
       const nx = nbrs[Math.floor(Math.random() * nbrs.length)];
       sr = nx.r; sc = nx.c; simVis.add(key(sr, sc));
+      simDepth++;
     }
 
-    // Backprop
-    const dist  = heuristic(sr, sc, g.r, g.c);
-    const score = dist === 0 ? 1 : 1 / (1 + dist);
-    let anc = node;
-    while (anc) { anc.visits++; anc.wins += score; anc = anc.parentNode; }
-    log('step', `MCTS iter=${iter} | node(${node.r},${node.c}) sim_dist=${dist.toFixed(1)}`);
+    // 4. Backpropagation
+    const dist = heuristic(sr, sc, g.r, g.c);
+    const score = (sr === g.r && sc === g.c) ? 1.0 : 1.0 / (1.0 + dist);
+    
+    let back = node;
+    while (back) { 
+      back.visits++; 
+      back.wins += score; 
+      back = back.parentNode; 
+    }
+    
+    log('step', `MCTS iter=${iter} | node(${node.r},${node.c}) sim_dist=${dist.toFixed(1)} score=${score.toFixed(3)}`);
     yield;
   }
-  emitNoPath();
+  
+  // Timeout: Return best path
+  let curr = root;
+  const bestPath = [];
+  while (curr) {
+    bestPath.push(curr);
+    if (curr.r === g.r && curr.c === g.c) break;
+    if (!curr.children || curr.children.length === 0) break;
+    curr = curr.children.reduce((best, ch) => ch.visits > best.visits ? ch : best, curr.children[0]);
+  }
+  
+  const pm = {};
+  for (let i = 1; i < bestPath.length; i++) {
+    pm[key(bestPath[i].r, bestPath[i].c)] = key(bestPath[i-1].r, bestPath[i-1].c);
+  }
+  const last = bestPath[bestPath.length-1];
+  emitPath(tracePathMap(pm, last.r, last.c));
+  if (last.r !== g.r || last.c !== g.c) {
+     log('error', `MCTS timeout setelah ${MAX_ITER} iter. Menampilkan rute terbaik sementara.`);
+  }
+  return 'DONE';
 }
 
 function* gen_Backtracking(s, g) {
@@ -1259,12 +1314,11 @@ function* gen_ACO(s, g) {
   const NUM_ANTS = 8;
   const MAX_ITER = 200;
   const pheromone = {};
-
   let bestPath = null;
+  let stagnantIterations = 0;
 
   for (let iter = 0; iter < MAX_ITER; iter++) {
     stepCount++;
-    // Buat semut baru
     const ants = Array.from({ length: NUM_ANTS }, () => ({
       r: s.r, c: s.c,
       path:    [key(s.r, s.c)],
@@ -1272,12 +1326,12 @@ function* gen_ACO(s, g) {
       done: false
     }));
 
-    // Jalankan semua semut
-    for (let step = 0; step < workerRows * workerCols; step++) {
-      let allDone = true;
+    // Ants explore step-by-step
+    let anyMoved = true;
+    while (anyMoved) {
+      anyMoved = false;
       for (const ant of ants) {
         if (ant.done) continue;
-        allDone = false;
         const [cr, cc] = ant.path[ant.path.length - 1].split(',').map(Number);
         markCurrent(cr, cc); markVisited(cr, cc);
 
@@ -1289,8 +1343,8 @@ function* gen_ACO(s, g) {
         const curKey = key(cr, cc);
         for (const n of nbrs) {
           const ek = `${curKey}-${key(n.r, n.c)}`;
-          const tau = pheromone[ek] || 1;
-          const eta = 1 / (1 + heuristic(n.r, n.c, g.r, g.c));
+          const tau = pheromone[ek] || 1.0;
+          const eta = 1.0 / (1.0 + heuristic(n.r, n.c, g.r, g.c));
           const p   = tau * eta * eta;
           probs.push({ n, p }); sum += p;
         }
@@ -1299,24 +1353,48 @@ function* gen_ACO(s, g) {
         const nk = key(next.r, next.c);
         ant.path.push(nk); ant.visited.add(nk);
         markQueued(next.r, next.c);
+        anyMoved = true;
       }
-      if (allDone) break;
+      if (anyMoved) yield; // Visualize ant movement
     }
 
-    // Deposit feromon
+    // 1. Global Evaporation
+    for (const edge in pheromone) {
+      pheromone[edge] *= 0.9;
+    }
+
+    let pathImproved = false;
+
+    // 2. Deposit Pheromone
     for (const ant of ants) {
       const len = ant.path.length;
       const [lr, lc] = ant.path[len - 1].split(',').map(Number);
       const atGoal   = (lr === g.r && lc === g.c);
-      if (!bestPath || (atGoal && len < bestPath.length)) bestPath = [...ant.path];
-      const deposit = atGoal ? (100 / len) : (1 / (heuristic(lr, lc, g.r, g.c) + 1));
-      for (let i = 0; i < len - 1; i++) {
-        const ek = `${ant.path[i]}-${ant.path[i + 1]}`;
-        pheromone[ek] = ((pheromone[ek] || 0) + deposit) * 0.9;
+      
+      if (atGoal) {
+        if (!bestPath || len < bestPath.length) {
+          bestPath = [...ant.path];
+          pathImproved = true;
+        }
+        const deposit = 100.0 / len;
+        for (let i = 0; i < len - 1; i++) {
+          const ek = `${ant.path[i]}-${ant.path[i + 1]}`;
+          pheromone[ek] = (pheromone[ek] || 1.0) + deposit;
+        }
       }
     }
 
-    log('step', `ACO iter=${iter} | Best path: ${bestPath ? bestPath.length : '-'}`);
+    if (bestPath) {
+      if (pathImproved) stagnantIterations = 0;
+      else stagnantIterations++;
+      
+      if (stagnantIterations >= 5) {
+        log('step', `ACO iter=${iter} | Best path: ${bestPath.length} | Converged (Early Stop)`);
+        break;
+      }
+    }
+
+    log('step', `ACO iter=${iter} | Best path: ${bestPath ? bestPath.length : '-'} | Stag: ${stagnantIterations}`);
     yield;
   }
 
@@ -1365,7 +1443,21 @@ function* gen_JPS(s, g) {
     log('step', `JPS → (${r},${c}) f=${Math.round((gv + heuristic(r, c, g.r, g.c)) * 10) / 10}`);
 
     if (r === g.r && c === g.c) {
-      emitPath(tracePath(parent, r, c));
+      const rawPath = tracePath(parent, r, c);
+      const expandedPath = [];
+      for (let i = 0; i < rawPath.length - 1; i++) {
+        expandedPath.push(rawPath[i]);
+        const [r1, c1] = rawPath[i].split(',').map(Number);
+        const [r2, c2] = rawPath[i+1].split(',').map(Number);
+        const dr = Math.sign(r2 - r1), dc = Math.sign(c2 - c1);
+        let cr = r1 + dr, cc = c1 + dc;
+        while (cr !== r2 || cc !== c2) {
+          expandedPath.push(key(cr, cc));
+          cr += dr; cc += dc;
+        }
+      }
+      expandedPath.push(rawPath[rawPath.length - 1]);
+      emitPath(expandedPath);
       return 'DONE';
     }
 
@@ -1378,6 +1470,14 @@ function* gen_JPS(s, g) {
           gScore[jpk]  = ng;
           parent[jpk]  = key(r, c);
           pq.push({ ...jp, g: ng, f: ng + heuristic(jp.r, jp.c, g.r, g.c) });
+          
+          // Mark scanned segment for visualization
+          const dr2 = Math.sign(jp.r - r), dc2 = Math.sign(jp.c - c);
+          let cr = r + dr2, cc = c + dc2;
+          while (cr !== jp.r || cc !== jp.c) {
+             markVisited(cr, cc);
+             cr += dr2; cc += dc2;
+          }
           markQueued(jp.r, jp.c);
         }
       }

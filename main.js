@@ -3029,7 +3029,34 @@ function _stepCmp(side) {
       const k = key(r, c);
       if (as.vis.has(k)) return false;
       as.vis.add(k); mC(r, c); mV(r, c);
-      if (r === goalP.r && c === goalP.c) return foundGoalFn(as.parent, r, c);
+      if (r === goalP.r && c === goalP.c) {
+        // Expand path
+        const rawPath = [];
+        let currNode = k;
+        while (currNode !== undefined && currNode !== null) {
+          rawPath.unshift(currNode);
+          currNode = as.parent.get(currNode);
+          if (currNode === -1 || currNode === undefined) break;
+        }
+        
+        const expandedMap = new Map();
+        for (let i = 1; i < rawPath.length; i++) {
+          const r1 = Math.floor(rawPath[i-1] / 1000), c1 = rawPath[i-1] % 1000;
+          const r2 = Math.floor(rawPath[i] / 1000), c2 = rawPath[i] % 1000;
+          const dr = Math.sign(r2 - r1), dc = Math.sign(c2 - c1);
+          let cr = r1 + dr, cc = c1 + dc;
+          let prevKey = rawPath[i-1];
+          while (cr !== r2 || cc !== c2) {
+            const curKey = key(cr, cc);
+            expandedMap.set(curKey, prevKey);
+            prevKey = curKey;
+            cr += dr; cc += dc;
+          }
+          expandedMap.set(rawPath[i], prevKey);
+        }
+        expandedMap.set(key(cmpStartPos.r, cmpStartPos.c), -1);
+        return foundGoalFn(expandedMap, r, c);
+      }
 
       const jump = (startR, startC, dr, dc) => {
         let cr = startR, cc = startC;
@@ -3059,6 +3086,13 @@ function _stepCmp(side) {
             as.gScore.set(jpk, ng);
             as.parent.set(jpk, k);
             as.pq.push({ ...jp, g: ng, f: ng + heur(jp.r, jp.c) });
+            
+            const dr2 = Math.sign(jp.r - r), dc2 = Math.sign(jp.c - c);
+            let cr = r + dr2, cc = c + dc2;
+            while (cr !== jp.r || cc !== jp.c) {
+               mV(cr, cc);
+               cr += dr2; cc += dc2;
+            }
             mQ(jp.r, jp.c);
           }
         }
@@ -3249,18 +3283,39 @@ function _stepCmp(side) {
       });
       as.ants = ants;
       if (allDone) {
+        as.pheromone.forEach((v, k) => as.pheromone.set(k, v * 0.9));
+        let pathImproved = false;
         as.ants.forEach(ant => {
           const len = ant.path.length;
           const end = ant.path[len - 1];
           const dist = heur(end.r, end.c);
           if (dist < as.bestDist) { as.bestDist = dist; as.bestPath = ant.path; }
-          const deposit = ant.win ? (100 / len) : (1 / (dist + 1));
-          for (let i = 0; i < len - 1; i++) {
-            const k = key(ant.path[i].r, ant.path[i].c) + '-' + key(ant.path[i+1].r, ant.path[i+1].c);
-            as.pheromone.set(k, (as.pheromone.get(k) || 1) + deposit);
+          if (ant.win) {
+            if (!as.globalBestPath || len < as.globalBestPath.length) {
+              as.globalBestPath = ant.path;
+              pathImproved = true;
+            }
+            const deposit = 100 / len;
+            for (let i = 0; i < len - 1; i++) {
+              const k = key(ant.path[i].r, ant.path[i].c) + '-' + key(ant.path[i+1].r, ant.path[i+1].c);
+              as.pheromone.set(k, (as.pheromone.get(k) || 1.0) + deposit);
+            }
           }
         });
-        as.pheromone.forEach((v, k) => as.pheromone.set(k, v * 0.9));
+        
+        if (as.globalBestPath) {
+          if (pathImproved) as.stagnant = 0;
+          else as.stagnant = (as.stagnant || 0) + 1;
+          
+          if (as.stagnant >= 5) {
+             const pMap = new Map();
+             for(let i=1; i<as.globalBestPath.length; i++) pMap.set(key(as.globalBestPath[i].r, as.globalBestPath[i].c), key(as.globalBestPath[i-1].r, as.globalBestPath[i-1].c));
+             pMap.set(key(as.globalBestPath[0].r, as.globalBestPath[0].c), -1);
+             const last = as.globalBestPath[as.globalBestPath.length-1];
+             return foundGoalFn(pMap, last.r, last.c);
+          }
+        }
+        
         as.iteration++;
         as.ants = null;
       }
