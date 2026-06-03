@@ -21,91 +21,91 @@
 'use strict';
 
 // ── Konfigurasi ────────────────────────────────────────────────────────
-let workerGrid       = [];
-let workerRows       = 0, workerCols = 0;
-let workerAlgo       = 'bfs';
-let workerHeuristic  = 'manhattan';
-let workerWeight     = 1.0;
-let workerBeamWidth  = 3;
+let workerGrid = [];
+let workerRows = 0, workerCols = 0;
+let workerAlgo = 'bfs';
+let workerHeuristic = 'manhattan';
+let workerWeight = 1.0;
+let workerBeamWidth = 3;
 let workerDepthLimit = 10;
-let startPos         = null, goalPos = null;
-let stepCount        = 0, visitedCount = 0;
-let isRunning        = false;
-let isPaused         = false;
-let isTurbo          = false;   // ← Turbo Mode flag
+let startPos = null, goalPos = null;
+let stepCount = 0, visitedCount = 0;
+let isRunning = false;
+let isPaused = false;
+let isTurbo = false;   // ← Turbo Mode flag
 
 // Speed table: [stepsPerTick, delayMs]
 const SPEED_TABLE = [
-  [1,   320],   // 1 – Sangat Lambat
-  [1,   140],   // 2 – Lambat
-  [3,    60],   // 3 – Sedang
-  [12,   16],   // 4 – Cepat
-  [50,   16],   // 5 – Sangat Cepat
+  [1, 320],   // 1 – Sangat Lambat
+  [1, 140],   // 2 – Lambat
+  [3, 60],   // 3 – Sedang
+  [12, 16],   // 4 – Cepat
+  [50, 16],   // 5 – Sangat Cepat
 ];
 let speedConfig = { stepsPerTick: 3, delayMs: 60 };
 
 // ── Generator state ────────────────────────────────────────────────────
-let algoGenerator    = null;    // Generator Function instance
-let tickHandle       = null;    // setTimeout handle
-let turboHandle      = null;    // setInterval handle untuk Turbo
+let algoGenerator = null;    // Generator Function instance
+let tickHandle = null;    // setTimeout handle
+let turboHandle = null;    // setInterval handle untuk Turbo
 
 // ── Dirty batch (dikumpulkan per tick, lalu di-flush sekaligus) ────────
-let pendingCells     = new Map();
-let pendingLogs      = [];
-let pendingInfo      = null;
-let pendingQueue     = null;
-let pendingPath      = null;
-let pendingDone      = null;
+let pendingCells = new Map();
+let pendingLogs = [];
+let pendingInfo = null;
+let pendingQueue = null;
+let pendingPath = null;
+let pendingDone = null;
 
 // Untuk Turbo Mode: batch lebih agresif
-let turboLastFlush   = 0;
+let turboLastFlush = 0;
 const TURBO_FLUSH_INTERVAL = 16; // ~60 fps
 
 // ── Message handler ────────────────────────────────────────────────────
-self.onmessage = function(e) {
+self.onmessage = function (e) {
   const { type } = e.data;
   switch (type) {
-    case 'init':        handleInit(e.data);     break;
-    case 'start':       handleStart();          break;
-    case 'pause':       handlePause();          break;
-    case 'resume':      handleResume();         break;
-    case 'stop':        handleStop();           break;
-    case 'step':        handleStep();           break;
-    case 'speed':       handleSpeed(e.data);    break;
-    case 'turbo':       handleTurbo(e.data);    break;
-    case 'gridUpdate':  handleGridUpdate(e.data); break;
+    case 'init': handleInit(e.data); break;
+    case 'start': handleStart(); break;
+    case 'pause': handlePause(); break;
+    case 'resume': handleResume(); break;
+    case 'stop': handleStop(); break;
+    case 'step': handleStep(); break;
+    case 'speed': handleSpeed(e.data); break;
+    case 'turbo': handleTurbo(e.data); break;
+    case 'gridUpdate': handleGridUpdate(e.data); break;
   }
 };
 
 function handleInit(data) {
   _stopAll();
-  workerGrid       = data.grid.map(row => [...row]);
-  workerRows       = data.rows;
-  workerCols       = data.cols;
-  workerAlgo       = data.algo;
-  workerHeuristic  = data.heuristic  || 'manhattan';
-  workerWeight     = (data.weight !== undefined && data.weight !== null) ? parseFloat(data.weight) : 1.0;
-  workerBeamWidth  = data.beamWidth  || 3;
+  workerGrid = data.grid.map(row => [...row]);
+  workerRows = data.rows;
+  workerCols = data.cols;
+  workerAlgo = data.algo;
+  workerHeuristic = data.heuristic || 'manhattan';
+  workerWeight = (data.weight !== undefined && data.weight !== null) ? parseFloat(data.weight) : 1.0;
+  workerBeamWidth = data.beamWidth || 3;
   workerDepthLimit = data.depthLimit || 10;
-  startPos         = data.startPos;
-  goalPos          = data.goalPos;
-  stepCount        = 0;
-  visitedCount     = 0;
-  isTurbo          = false;
-  pendingCells     = new Map();
-  pendingLogs      = [];
+  startPos = data.startPos;
+  goalPos = data.goalPos;
+  stepCount = 0;
+  visitedCount = 0;
+  isTurbo = false;
+  pendingCells = new Map();
+  pendingLogs = [];
 
   // Buat generator baru dari algoritma yang dipilih
-  algoGenerator    = makeAlgorithmGenerator();
+  algoGenerator = makeAlgorithmGenerator();
 
-  log('system', `Worker init [GENERATOR MODE]: ${workerAlgo} | ${workerRows}×${workerCols}${workerAlgo==='weighted_astar' ? ` | w=${workerWeight}` : ''}`);
+  log('system', `Worker init [GENERATOR MODE]: ${workerAlgo} | ${workerRows}×${workerCols}${workerAlgo === 'weighted_astar' ? ` | w=${workerWeight}` : ''}`);
   flush();
 }
 
 function handleStart() {
   if (!algoGenerator) return;
   isRunning = true;
-  isPaused  = false;
+  isPaused = false;
   if (isTurbo) {
     _startTurboLoop();
   } else {
@@ -130,7 +130,7 @@ function handleResume() {
 
 function handleStop() {
   isRunning = false;
-  isPaused  = false;
+  isPaused = false;
   _stopAll();
   algoGenerator = null;
 }
@@ -149,7 +149,7 @@ function handleSpeed(data) {
   const idx = Math.max(1, Math.min(5, data.value)) - 1;
   const [spt, dms] = SPEED_TABLE[idx];
   speedConfig.stepsPerTick = spt;
-  speedConfig.delayMs      = dms;
+  speedConfig.delayMs = dms;
 }
 
 function handleTurbo(data) {
@@ -171,7 +171,7 @@ function handleGridUpdate(data) {
     data.cells.forEach(({ r, c, state }) => { workerGrid[r][c] = state; });
   }
   if (data.startPos) startPos = data.startPos;
-  if (data.goalPos)  goalPos  = data.goalPos;
+  if (data.goalPos) goalPos = data.goalPos;
 }
 
 // ── Normal Mode Loop (Interval-Based Ticking) ─────────────────────────
@@ -223,7 +223,7 @@ function _startTurboLoop() {
 }
 
 function _stopAll() {
-  if (tickHandle)  { clearTimeout(tickHandle);   tickHandle  = null; }
+  if (tickHandle) { clearTimeout(tickHandle); tickHandle = null; }
   if (turboHandle) { clearInterval(turboHandle); turboHandle = null; }
 }
 
@@ -238,29 +238,29 @@ function flush() {
       const sepIdx = k.indexOf(',');
       cells.push({ r: +k.slice(0, sepIdx), c: +k.slice(sepIdx + 1), state });
     });
-    msg.cells        = cells;
-    msg.stepCount    = stepCount;
+    msg.cells = cells;
+    msg.stepCount = stepCount;
     msg.visitedCount = visitedCount;
-    pendingCells     = new Map();
+    pendingCells = new Map();
     hasData = true;
   }
 
   if (pendingLogs.length > 0) {
-    msg.logs    = pendingLogs.slice();
+    msg.logs = pendingLogs.slice();
     pendingLogs = [];
     hasData = true;
   }
 
   if (pendingInfo !== null) { msg.info = pendingInfo; pendingInfo = null; hasData = true; }
   if (pendingQueue !== null) { msg.queue = pendingQueue; pendingQueue = null; hasData = true; }
-  if (pendingPath  !== null) { msg.path  = pendingPath;  pendingPath  = null; hasData = true; }
-  if (pendingDone  !== null) { msg.done  = pendingDone;  pendingDone  = null; hasData = true; }
+  if (pendingPath !== null) { msg.path = pendingPath; pendingPath = null; hasData = true; }
+  if (pendingDone !== null) { msg.done = pendingDone; pendingDone = null; hasData = true; }
 
   if (hasData) self.postMessage(msg);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
-function key(r, c)    { return `${r},${c}`; }
+function key(r, c) { return `${r},${c}`; }
 function keyInt(r, c) { return r * 10000 + c; } // integer key for Map (faster)
 
 function markCell(r, c, state) {
@@ -301,14 +301,14 @@ function heuristic(ar, ac, br, bc) {
     case 'manhattan': return dr + dc;
     case 'euclidean': return Math.sqrt(dr * dr + dc * dc);
     case 'chebyshev': return Math.max(dr, dc);
-    case 'octile':    return Math.max(dr, dc) + (Math.SQRT2 - 1) * Math.min(dr, dc);
-    default:          return dr + dc;
+    case 'octile': return Math.max(dr, dc) + (Math.SQRT2 - 1) * Math.min(dr, dc);
+    default: return dr + dc;
   }
 }
 
 function getNeighbors(r, c, diagonal = false) {
-  const dirs = [[0,1],[1,0],[0,-1],[-1,0]];
-  if (diagonal) dirs.push([1,1],[1,-1],[-1,1],[-1,-1]);
+  const dirs = [[0, 1], [1, 0], [0, -1], [-1, 0]];
+  if (diagonal) dirs.push([1, 1], [1, -1], [-1, 1], [-1, -1]);
   const res = [];
   for (const [dr, dc] of dirs) {
     const nr = r + dr, nc = c + dc;
@@ -359,30 +359,30 @@ function makeAlgorithmGenerator() {
   const s = startPos, g = goalPos;
 
   switch (workerAlgo) {
-    case 'bfs':             return gen_BFS(s, g);
-    case 'dfs':             return gen_DFS(s, g);
-    case 'dls':             return gen_DLS(s, g);
-    case 'ids':             return gen_IDS(s, g);
-    case 'ucs':             return gen_UCS(s, g);
-    case 'bidirectional':   return gen_BiDir(s, g);
-    case 'greedy':          return gen_Greedy(s, g);
-    case 'astar':           return gen_AStar(s, g, 1.0);
-    case 'weighted_astar':  return gen_AStar(s, g, workerWeight);
-    case 'idastar':         return gen_IDAStar(s, g);
-    case 'beam':            return gen_Beam(s, g);
-    case 'hillclimbing':    return gen_HC(s, g, false);
-    case 'steepest':        return gen_HC(s, g, true);
+    case 'bfs': return gen_BFS(s, g);
+    case 'dfs': return gen_DFS(s, g);
+    case 'dls': return gen_DLS(s, g);
+    case 'ids': return gen_IDS(s, g);
+    case 'ucs': return gen_UCS(s, g);
+    case 'bidirectional': return gen_BiDir(s, g);
+    case 'greedy': return gen_Greedy(s, g);
+    case 'astar': return gen_AStar(s, g, 1.0);
+    case 'weighted_astar': return gen_AStar(s, g, workerWeight);
+    case 'idastar': return gen_IDAStar(s, g);
+    case 'beam': return gen_Beam(s, g);
+    case 'hillclimbing': return gen_HC(s, g, false);
+    case 'steepest': return gen_HC(s, g, true);
     case 'simulated_annealing': return gen_SA(s, g);
-    case 'tabu':            return gen_Tabu(s, g);
-    case 'genetic':         return gen_Genetic(s, g);
-    case 'minimax':         return gen_Minimax(s, g);
-    case 'alphabeta':       return gen_AlphaBeta(s, g);
-    case 'mcts':            return gen_MCTS(s, g);
-    case 'backtracking':    return gen_Backtracking(s, g);
-    case 'ants':            return gen_ACO(s, g);
-    case 'jps':             return gen_JPS(s, g);
-    case 'garislintang':    return gen_GarisLintang(s, g);
-    default:                return gen_BFS(s, g);
+    case 'tabu': return gen_Tabu(s, g);
+    case 'genetic': return gen_Genetic(s, g);
+    case 'minimax': return gen_Minimax(s, g);
+    case 'alphabeta': return gen_AlphaBeta(s, g);
+    case 'mcts': return gen_MCTS(s, g);
+    case 'backtracking': return gen_Backtracking(s, g);
+    case 'ants': return gen_ACO(s, g);
+    case 'jps': return gen_JPS(s, g);
+    case 'garislintang': return gen_GarisLintang(s, g);
+    default: return gen_BFS(s, g);
   }
 }
 
@@ -394,8 +394,8 @@ function makeAlgorithmGenerator() {
 
 function* gen_BFS(s, g) {
   const visited = new Set([key(s.r, s.c)]);
-  const parent  = {};
-  const queue   = [{ r: s.r, c: s.c }];
+  const parent = {};
+  const queue = [{ r: s.r, c: s.c }];
 
   while (queue.length) {
     stepCount++;
@@ -426,8 +426,8 @@ function* gen_BFS(s, g) {
 
 function* gen_DFS(s, g) {
   const visited = new Set();
-  const parent  = {};
-  const stack   = [{ r: s.r, c: s.c }];
+  const parent = {};
+  const stack = [{ r: s.r, c: s.c }];
 
   while (stack.length) {
     const { r, c } = stack.pop();
@@ -460,8 +460,8 @@ function* gen_DFS(s, g) {
 function* gen_DLS(s, g) {
   const L = workerDepthLimit;
   const visited = new Set();
-  const parent  = {};
-  const stack   = [{ r: s.r, c: s.c, depth: 0 }];
+  const parent = {};
+  const stack = [{ r: s.r, c: s.c, depth: 0 }];
 
   while (stack.length) {
     const { r, c, depth } = stack.pop();
@@ -506,8 +506,8 @@ function* gen_IDS(s, g) {
         }
 
     const iterVisited = new Set();
-    const actualPath  = [];
-    const stack       = [{ r: s.r, c: s.c, depth: 0 }];
+    const actualPath = [];
+    const stack = [{ r: s.r, c: s.c, depth: 0 }];
 
     while (stack.length) {
       const cur = stack.pop();
@@ -551,9 +551,9 @@ function* gen_IDS(s, g) {
 
 function* gen_UCS(s, g) {
   const visited = new Set();
-  const parent  = {};
+  const parent = {};
   const costMap = { [key(s.r, s.c)]: 0 };
-  const pq      = [{ r: s.r, c: s.c, cost: 0 }];
+  const pq = [{ r: s.r, c: s.c, cost: 0 }];
 
   while (pq.length) {
     pq.sort((a, b) => a.cost - b.cost);
@@ -573,11 +573,11 @@ function* gen_UCS(s, g) {
     }
 
     for (const n of getNeighbors(r, c)) {
-      const nk  = key(n.r, n.c);
+      const nk = key(n.r, n.c);
       const nc2 = cost + 1;
       if (costMap[nk] === undefined || nc2 < costMap[nk]) {
         costMap[nk] = nc2;
-        parent[nk]  = key(r, c);
+        parent[nk] = key(r, c);
         pq.push({ ...n, cost: nc2 });
         markQueued(n.r, n.c);
       }
@@ -675,8 +675,8 @@ function* gen_BiDir(s, g) {
 
 function* gen_Greedy(s, g) {
   const visited = new Set();
-  const parent  = {};
-  const pq      = [{ r: s.r, c: s.c, h: heuristic(s.r, s.c, g.r, g.c) }];
+  const parent = {};
+  const pq = [{ r: s.r, c: s.c, h: heuristic(s.r, s.c, g.r, g.c) }];
 
   while (pq.length) {
     pq.sort((a, b) => a.h - b.h);
@@ -710,10 +710,10 @@ function* gen_Greedy(s, g) {
 
 function* gen_AStar(s, g, w) {
   const visited = new Set();
-  const parent  = {};
-  const gScore  = {};
+  const parent = {};
+  const gScore = {};
   gScore[key(s.r, s.c)] = 0;
-  const pq      = [{ r: s.r, c: s.c, g: 0, f: w * heuristic(s.r, s.c, g.r, g.c) }];
+  const pq = [{ r: s.r, c: s.c, g: 0, f: w * heuristic(s.r, s.c, g.r, g.c) }];
   // Expose gScore untuk markCurrent info panel
   gen_AStar._gScore = gScore;
 
@@ -738,8 +738,8 @@ function* gen_AStar(s, g, w) {
       const ng = gv + 1;
       // Fix: gunakan === undefined agar cost 0 tidak dianggap falsy
       if (gScore[nk] === undefined || ng < gScore[nk]) {
-        gScore[nk]  = ng;
-        parent[nk]  = key(r, c);
+        gScore[nk] = ng;
+        parent[nk] = key(r, c);
         pq.push({ ...n, g: ng, f: ng + w * heuristic(n.r, n.c, g.r, g.c) });
         markQueued(n.r, n.c);
       }
@@ -764,10 +764,10 @@ function* gen_IDAStar(s, g) {
           pendingCells.set(key(r, c), 'unvisited');
         }
 
-    const iterVisited  = new Set();
-    const actualPath   = [];
-    const stack        = [{ r: s.r, c: s.c, gVal: 0 }];
-    let   nextThresh   = Infinity;
+    const iterVisited = new Set();
+    const actualPath = [];
+    const stack = [{ r: s.r, c: s.c, gVal: 0 }];
+    let nextThresh = Infinity;
 
     while (stack.length) {
       const cur = stack.pop();
@@ -811,9 +811,9 @@ function* gen_IDAStar(s, g) {
 
 function* gen_Beam(s, g) {
   const visited = new Set([key(s.r, s.c)]);
-  const parent  = {};
-  const W       = workerBeamWidth;
-  let   beam    = [{ r: s.r, c: s.c, h: heuristic(s.r, s.c, g.r, g.c) }];
+  const parent = {};
+  const W = workerBeamWidth;
+  let beam = [{ r: s.r, c: s.c, h: heuristic(s.r, s.c, g.r, g.c) }];
 
   while (beam.length) {
     stepCount++;
@@ -852,8 +852,8 @@ function* gen_Beam(s, g) {
 
 function* gen_HC(s, g, steepest) {
   const visited = new Set([key(s.r, s.c)]);
-  const parent  = {};
-  let   cur     = { r: s.r, c: s.c };
+  const parent = {};
+  let cur = { r: s.r, c: s.c };
 
   while (true) {
     stepCount++;
@@ -864,8 +864,8 @@ function* gen_HC(s, g, steepest) {
       return 'DONE';
     }
 
-    const nbrs   = getNeighbors(r, c).filter(n => !visited.has(key(n.r, n.c)));
-    const curH   = heuristic(r, c, g.r, g.c);
+    const nbrs = getNeighbors(r, c).filter(n => !visited.has(key(n.r, n.c)));
+    const curH = heuristic(r, c, g.r, g.c);
 
     if (!nbrs.length) break;
 
@@ -891,46 +891,98 @@ function* gen_HC(s, g, steepest) {
 }
 
 function* gen_SA(s, g) {
-  let cur      = { r: s.r, c: s.c };
-  let temp     = 200;
-  const cool   = 0.995;
-  const path   = [key(s.r, s.c)];
+  // ── Simulated Annealing — perbaikan path reconstruction ────────────────
+  //
+  // Masalah versi lama:
+  //   1. path[] hanya di-push saat accept=true, tapi tidak di-pop saat
+  //      algoritma "mundur" (reject + berada di node yang sudah dikunjungi).
+  //      Akibatnya tracePathMap menghasilkan jalur yang salah / tidak sampai goal.
+  //   2. markVisited() dipanggil setiap step → sel goal tertimpa 'visited'
+  //      sebelum sempat dideteksi, menyebabkan goal tidak ter-highlight.
+  //   3. Bila suhu habis tanpa menemukan goal, langsung emitNoPath() tanpa
+  //      mencoba emit posisi terbaik yang pernah dicapai.
+  //
+  // Solusi:
+  //   - Gunakan Map `parent` seperti BFS/DFS: setiap kali pindah ke node baru
+  //     (accept=true) rekam parent[next] = cur. Path lalu ditelusuri mundur
+  //     dari goal → start persis seperti algoritma lain.
+  //   - Simpan `bestNode` = node dengan h(n) terkecil yang pernah dikunjungi,
+  //     agar bila suhu habis bisa emit partial path ke sana.
+  //   - markCurrent() saja tiap step; markVisited() hanya saat benar-benar
+  //     accept (pindah), sehingga state 'goal' tidak ditimpa.
+
+  let cur = { r: s.r, c: s.c };
+  let temp = 200;
+  const cool = 0.995;
+
+  // parent map untuk rekonstruksi jalur — key: node, value: parent node key
+  const parent = {};
+  parent[key(s.r, s.c)] = null;
+
+  // Lacak node terbaik (paling dekat ke goal) yang pernah dikunjungi
+  let bestNode = { r: s.r, c: s.c };
+  let bestH = heuristic(s.r, s.c, g.r, g.c);
 
   while (temp > 0.001) {
     stepCount++;
     const { r, c } = cur;
-    markCurrent(r, c); markVisited(r, c);
-    temp *= cool;
 
+    // Cek goal SEBELUM marking agar warna 'goal' tidak tertimpa
     if (r === g.r && c === g.c) {
-      const pm = {};
-      for (let i = 1; i < path.length; i++) pm[path[i]] = path[i - 1];
-      emitPath(tracePathMap(pm, r, c));
+      emitPath(tracePath(parent, r, c));
       return 'DONE';
     }
 
+    markCurrent(r, c);
+
+    temp *= cool;
+
     const nbrs = getNeighbors(r, c);
     if (!nbrs.length) break;
-    const next  = nbrs[Math.floor(Math.random() * nbrs.length)];
-    const dE    = heuristic(r, c, g.r, g.c) - heuristic(next.r, next.c, g.r, g.c);
-    const accept = dE > 0 || Math.random() < Math.exp(dE / (temp * 0.1));
+
+    const next = nbrs[Math.floor(Math.random() * nbrs.length)];
+    const curH = heuristic(r, c, g.r, g.c);
+    const nextH = heuristic(next.r, next.c, g.r, g.c);
+    const dE = curH - nextH;   // positif = next lebih baik
+    const accept = dE > 0 || Math.random() < Math.exp(dE / Math.max(temp * 0.1, 1e-9));
 
     if (accept) {
-      path.push(key(next.r, next.c));
+      // Tandai perpindahan: visited untuk cur, queued untuk next
+      markVisited(r, c);
+      const nk = key(next.r, next.c);
+      // Hanya catat parent jika belum pernah dikunjungi lewat rute lebih baik
+      if (parent[nk] === undefined) {
+        parent[nk] = key(r, c);
+      }
       markQueued(next.r, next.c);
       cur = next;
+
+      // Update best node
+      if (nextH < bestH) {
+        bestH = nextH;
+        bestNode = next;
+      }
     }
+
     log('step', `SA T=${temp.toFixed(2)} → (${next.r},${next.c}) ΔE=${dE.toFixed(2)} ${accept ? '✓' : '✗'}`);
     yield;
+  }
+
+  // Suhu habis tanpa menemukan goal.
+  // Jika bestNode bukan start, emit jalur partial ke sana sebagai best effort.
+  if (bestNode.r !== s.r || bestNode.c !== s.c) {
+    log('warn', `SA suhu habis — emit jalur terbaik ke (${bestNode.r},${bestNode.c}) h=${bestH.toFixed(1)}`);
+    emitPath(tracePath(parent, bestNode.r, bestNode.c));
+    return 'DONE';
   }
   emitNoPath();
 }
 
 function* gen_Tabu(s, g) {
-  let cur        = { r: s.r, c: s.c };
+  let cur = { r: s.r, c: s.c };
   const tabuList = [key(s.r, s.c)];
-  const TMAX     = 15;
-  const path     = [key(s.r, s.c)];
+  const TMAX = 15;
+  const path = [key(s.r, s.c)];
 
   for (let iter = 0; iter < workerRows * workerCols * 3; iter++) {
     stepCount++;
@@ -948,7 +1000,7 @@ function* gen_Tabu(s, g) {
     if (!nbrs.length) break;
     nbrs.sort((a, b) => heuristic(a.r, a.c, g.r, g.c) - heuristic(b.r, b.c, g.r, g.c));
     const best = nbrs[0];
-    const bk   = key(best.r, best.c);
+    const bk = key(best.r, best.c);
     path.push(bk);
     tabuList.push(bk);
     if (tabuList.length > TMAX) tabuList.shift();
@@ -962,7 +1014,7 @@ function* gen_Tabu(s, g) {
 
 function* gen_Genetic(s, g) {
   const POP_SIZE = 20;
-  const MAX_GEN  = 200;
+  const MAX_GEN = 200;
 
   function randPath() {
     const p = [{ r: s.r, c: s.c }];
@@ -980,7 +1032,7 @@ function* gen_Genetic(s, g) {
   }
 
   let population = Array.from({ length: POP_SIZE }, randPath);
-  let bestEver   = null;
+  let bestEver = null;
 
   for (let gen = 0; gen < MAX_GEN; gen++) {
     stepCount++;
@@ -1060,10 +1112,10 @@ function* gen_Genetic(s, g) {
 }
 
 function* gen_Minimax(s, g) {
-  const DEPTH  = 4;
+  const DEPTH = 4;
   const visited = new Set([key(s.r, s.c)]);
-  const parent  = {};
-  let   cur     = { r: s.r, c: s.c };
+  const parent = {};
+  let cur = { r: s.r, c: s.c };
 
   function minimax(r, c, depth, isMax, pVis) {
     if (depth === 0 || (r === g.r && c === g.c)) return -heuristic(r, c, g.r, g.c);
@@ -1075,7 +1127,7 @@ function* gen_Minimax(s, g) {
       const v = minimax(n.r, n.c, depth - 1, !isMax, pVis);
       pVis.delete(key(n.r, n.c));
       if (isMax) val = Math.max(val, v);
-      else       val = Math.min(val, v);
+      else val = Math.min(val, v);
     }
     return val;
   }
@@ -1095,7 +1147,7 @@ function* gen_Minimax(s, g) {
     let bestVal = -Infinity, bestNext = null;
     for (const n of nbrs) {
       const pVis = new Set([key(n.r, n.c)]);
-      const val  = minimax(n.r, n.c, DEPTH - 1, false, pVis);
+      const val = minimax(n.r, n.c, DEPTH - 1, false, pVis);
       markQueued(n.r, n.c);
       if (val > bestVal) { bestVal = val; bestNext = n; }
     }
@@ -1111,11 +1163,11 @@ function* gen_Minimax(s, g) {
 }
 
 function* gen_AlphaBeta(s, g) {
-  const DEPTH   = 4;
+  const DEPTH = 4;
   const visited = new Set([key(s.r, s.c)]);
-  const parent  = {};
-  let   cur     = { r: s.r, c: s.c };
-  let   pruned  = 0;
+  const parent = {};
+  let cur = { r: s.r, c: s.c };
+  let pruned = 0;
 
   function ab(r, c, depth, alpha, beta, isMax, pVis) {
     if (depth === 0 || (r === g.r && c === g.c)) return -heuristic(r, c, g.r, g.c);
@@ -1127,7 +1179,7 @@ function* gen_AlphaBeta(s, g) {
       const v = ab(n.r, n.c, depth - 1, alpha, beta, !isMax, pVis);
       pVis.delete(key(n.r, n.c));
       if (isMax) { val = Math.max(val, v); alpha = Math.max(alpha, val); }
-      else       { val = Math.min(val, v); beta  = Math.min(beta, val); }
+      else { val = Math.min(val, v); beta = Math.min(beta, val); }
       if (beta <= alpha) { pruned++; break; }
     }
     return val;
@@ -1148,7 +1200,7 @@ function* gen_AlphaBeta(s, g) {
     let bestVal = -Infinity, bestNext = null;
     for (const n of nbrs) {
       const pVis = new Set([key(n.r, n.c)]);
-      const val  = ab(n.r, n.c, DEPTH - 1, -Infinity, Infinity, false, pVis);
+      const val = ab(n.r, n.c, DEPTH - 1, -Infinity, Infinity, false, pVis);
       markQueued(n.r, n.c);
       if (val > bestVal) { bestVal = val; bestNext = n; }
     }
@@ -1176,9 +1228,9 @@ function* gen_MCTS(s, g) {
       const unvisited = node.children.filter(ch => ch.visits === 0);
       if (unvisited.length > 0) {
         node = unvisited[Math.floor(Math.random() * unvisited.length)];
-        break; 
+        break;
       } else if (node.children.length === 0) {
-        break; 
+        break;
       } else {
         let bestUcb = -Infinity, nextNode = null;
         for (const ch of node.children) {
@@ -1190,7 +1242,7 @@ function* gen_MCTS(s, g) {
     }
 
     markCurrent(node.r, node.c); markVisited(node.r, node.c);
-    
+
     if (node.r === g.r && node.c === g.c) {
       const pm = {};
       let c2 = node;
@@ -1204,22 +1256,22 @@ function* gen_MCTS(s, g) {
       let anc = node;
       const pathSet = new Set();
       while (anc) { pathSet.add(key(anc.r, anc.c)); anc = anc.parentNode; }
-      
+
       const nbrs = getNeighbors(node.r, node.c).filter(n => !pathSet.has(key(n.r, n.c)));
       node.children = nbrs.map(n => {
         markQueued(n.r, n.c);
         return { ...n, parentNode: node, children: null, visits: 0, wins: 0 };
       });
-      
+
       if (node.children.length > 0) {
         node = node.children[Math.floor(Math.random() * node.children.length)];
         markCurrent(node.r, node.c); markVisited(node.r, node.c);
         if (node.r === g.r && node.c === g.c) {
-           const pm = {};
-           let c2 = node;
-           while (c2.parentNode) { pm[key(c2.r, c2.c)] = key(c2.parentNode.r, c2.parentNode.c); c2 = c2.parentNode; }
-           emitPath(tracePathMap(pm, node.r, node.c));
-           return 'DONE';
+          const pm = {};
+          let c2 = node;
+          while (c2.parentNode) { pm[key(c2.r, c2.c)] = key(c2.parentNode.r, c2.parentNode.c); c2 = c2.parentNode; }
+          emitPath(tracePathMap(pm, node.r, node.c));
+          return 'DONE';
         }
       }
     }
@@ -1229,7 +1281,7 @@ function* gen_MCTS(s, g) {
     const simVis = new Set();
     let anc2 = node;
     while (anc2) { simVis.add(key(anc2.r, anc2.c)); anc2 = anc2.parentNode; }
-    
+
     let simDepth = 0;
     while (simDepth < 30) {
       if (sr === g.r && sc === g.c) break;
@@ -1243,18 +1295,18 @@ function* gen_MCTS(s, g) {
     // 4. Backpropagation
     const dist = heuristic(sr, sc, g.r, g.c);
     const score = (sr === g.r && sc === g.c) ? 1.0 : 1.0 / (1.0 + dist);
-    
+
     let back = node;
-    while (back) { 
-      back.visits++; 
-      back.wins += score; 
-      back = back.parentNode; 
+    while (back) {
+      back.visits++;
+      back.wins += score;
+      back = back.parentNode;
     }
-    
+
     log('step', `MCTS iter=${iter} | node(${node.r},${node.c}) sim_dist=${dist.toFixed(1)} score=${score.toFixed(3)}`);
     yield;
   }
-  
+
   // Timeout: Return best path
   let curr = root;
   const bestPath = [];
@@ -1264,23 +1316,23 @@ function* gen_MCTS(s, g) {
     if (!curr.children || curr.children.length === 0) break;
     curr = curr.children.reduce((best, ch) => ch.visits > best.visits ? ch : best, curr.children[0]);
   }
-  
+
   const pm = {};
   for (let i = 1; i < bestPath.length; i++) {
-    pm[key(bestPath[i].r, bestPath[i].c)] = key(bestPath[i-1].r, bestPath[i-1].c);
+    pm[key(bestPath[i].r, bestPath[i].c)] = key(bestPath[i - 1].r, bestPath[i - 1].c);
   }
-  const last = bestPath[bestPath.length-1];
+  const last = bestPath[bestPath.length - 1];
   emitPath(tracePathMap(pm, last.r, last.c));
   if (last.r !== g.r || last.c !== g.c) {
-     log('error', `MCTS timeout setelah ${MAX_ITER} iter. Menampilkan rute terbaik sementara.`);
+    log('error', `MCTS timeout setelah ${MAX_ITER} iter. Menampilkan rute terbaik sementara.`);
   }
   return 'DONE';
 }
 
 function* gen_Backtracking(s, g) {
   const visited = new Set([key(s.r, s.c)]);
-  const parent  = {};
-  const stack   = [{ r: s.r, c: s.c }];
+  const parent = {};
+  const stack = [{ r: s.r, c: s.c }];
 
   while (stack.length) {
     const { r, c } = stack.pop();
@@ -1321,7 +1373,7 @@ function* gen_ACO(s, g) {
     stepCount++;
     const ants = Array.from({ length: NUM_ANTS }, () => ({
       r: s.r, c: s.c,
-      path:    [key(s.r, s.c)],
+      path: [key(s.r, s.c)],
       visited: new Set([key(s.r, s.c)]),
       done: false
     }));
@@ -1345,7 +1397,7 @@ function* gen_ACO(s, g) {
           const ek = `${curKey}-${key(n.r, n.c)}`;
           const tau = pheromone[ek] || 1.0;
           const eta = 1.0 / (1.0 + heuristic(n.r, n.c, g.r, g.c));
-          const p   = tau * eta * eta;
+          const p = tau * eta * eta;
           probs.push({ n, p }); sum += p;
         }
         let rnd = Math.random() * sum, next = nbrs[0];
@@ -1369,8 +1421,8 @@ function* gen_ACO(s, g) {
     for (const ant of ants) {
       const len = ant.path.length;
       const [lr, lc] = ant.path[len - 1].split(',').map(Number);
-      const atGoal   = (lr === g.r && lc === g.c);
-      
+      const atGoal = (lr === g.r && lc === g.c);
+
       if (atGoal) {
         if (!bestPath || len < bestPath.length) {
           bestPath = [...ant.path];
@@ -1387,7 +1439,7 @@ function* gen_ACO(s, g) {
     if (bestPath) {
       if (pathImproved) stagnantIterations = 0;
       else stagnantIterations++;
-      
+
       if (stagnantIterations >= 5) {
         log('step', `ACO iter=${iter} | Best path: ${bestPath.length} | Converged (Early Stop)`);
         break;
@@ -1410,9 +1462,9 @@ function* gen_ACO(s, g) {
 
 function* gen_JPS(s, g) {
   const visited = new Set();
-  const parent  = {};
-  const gScore  = { [key(s.r, s.c)]: 0 };
-  const pq      = [{ r: s.r, c: s.c, g: 0, f: heuristic(s.r, s.c, g.r, g.c) }];
+  const parent = {};
+  const gScore = { [key(s.r, s.c)]: 0 };
+  const pq = [{ r: s.r, c: s.c, g: 0, f: heuristic(s.r, s.c, g.r, g.c) }];
 
   function jump(r, c, dr, dc) {
     while (true) {
@@ -1421,11 +1473,11 @@ function* gen_JPS(s, g) {
       if (nr === g.r && nc === g.c) return { r: nr, c: nc };
       if (dr !== 0) {
         if ((nc + 1 < workerCols && workerGrid[r][nc + 1] === 'wall' && workerGrid[nr][nc + 1] !== 'wall') ||
-            (nc - 1 >= 0         && workerGrid[r][nc - 1] === 'wall' && workerGrid[nr][nc - 1] !== 'wall'))
+          (nc - 1 >= 0 && workerGrid[r][nc - 1] === 'wall' && workerGrid[nr][nc - 1] !== 'wall'))
           return { r: nr, c: nc };
       } else {
         if ((nr + 1 < workerRows && workerGrid[nr + 1][c] === 'wall' && workerGrid[nr + 1][nc] !== 'wall') ||
-            (nr - 1 >= 0         && workerGrid[nr - 1][c] === 'wall' && workerGrid[nr - 1][nc] !== 'wall'))
+          (nr - 1 >= 0 && workerGrid[nr - 1][c] === 'wall' && workerGrid[nr - 1][nc] !== 'wall'))
           return { r: nr, c: nc };
       }
       r = nr; c = nc;
@@ -1448,7 +1500,7 @@ function* gen_JPS(s, g) {
       for (let i = 0; i < rawPath.length - 1; i++) {
         expandedPath.push(rawPath[i]);
         const [r1, c1] = rawPath[i].split(',').map(Number);
-        const [r2, c2] = rawPath[i+1].split(',').map(Number);
+        const [r2, c2] = rawPath[i + 1].split(',').map(Number);
         const dr = Math.sign(r2 - r1), dc = Math.sign(c2 - c1);
         let cr = r1 + dr, cc = c1 + dc;
         while (cr !== r2 || cc !== c2) {
@@ -1461,22 +1513,22 @@ function* gen_JPS(s, g) {
       return 'DONE';
     }
 
-    for (const [dr, dc] of [[0,1],[1,0],[0,-1],[-1,0]]) {
+    for (const [dr, dc] of [[0, 1], [1, 0], [0, -1], [-1, 0]]) {
       const jp = jump(r, c, dr, dc);
       if (jp) {
         const jpk = key(jp.r, jp.c);
-        const ng  = gv + Math.abs(jp.r - r) + Math.abs(jp.c - c);
+        const ng = gv + Math.abs(jp.r - r) + Math.abs(jp.c - c);
         if (gScore[jpk] === undefined || ng < gScore[jpk]) {
-          gScore[jpk]  = ng;
-          parent[jpk]  = key(r, c);
+          gScore[jpk] = ng;
+          parent[jpk] = key(r, c);
           pq.push({ ...jp, g: ng, f: ng + heuristic(jp.r, jp.c, g.r, g.c) });
-          
+
           // Mark scanned segment for visualization
           const dr2 = Math.sign(jp.r - r), dc2 = Math.sign(jp.c - c);
           let cr = r + dr2, cc = c + dc2;
           while (cr !== jp.r || cc !== jp.c) {
-             markVisited(cr, cc);
-             cr += dr2; cc += dc2;
+            markVisited(cr, cc);
+            cr += dr2; cc += dc2;
           }
           markQueued(jp.r, jp.c);
         }
@@ -1490,10 +1542,10 @@ function* gen_JPS(s, g) {
 
 function* gen_GarisLintang(s, g) {
   const visited = new Set();
-  const parent  = {};
-  const gScore  = { [key(s.r, s.c)]: 0 };
-  const K       = 2.5; // penalti cross-track
-  const pq      = [{ r: s.r, c: s.c, g: 0, f: heuristic(s.r, s.c, g.r, g.c) }];
+  const parent = {};
+  const gScore = { [key(s.r, s.c)]: 0 };
+  const K = 2.5; // penalti cross-track
+  const pq = [{ r: s.r, c: s.c, g: 0, f: heuristic(s.r, s.c, g.r, g.c) }];
 
   while (pq.length) {
     pq.sort((a, b) => a.f - b.f);

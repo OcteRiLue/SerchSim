@@ -309,7 +309,7 @@ function render3D(ctx, W, H) {
       const faces = [
         { p: [v[4], v[5], v[1], v[0]], shade: isLight ? -20 : -35 }, // Back
         { p: [v[5], v[7], v[3], v[1]], shade: isLight ? -10 : -25 }, // Right
-        { p: [v[7], v[6], v[2], v[3]], shade: isLight ? -5  : -15 }, // Front
+        { p: [v[7], v[6], v[2], v[3]], shade: isLight ? -5 : -15 }, // Front
         { p: [v[6], v[4], v[0], v[2]], shade: isLight ? -15 : -30 }, // Left
         { p: [v[4], v[5], v[7], v[6]], shade: 0 }                    // Top
       ];
@@ -493,7 +493,7 @@ function selectAlgo(el, algo) {
     el.classList.add('active');
     const info = ALGO_INFO[algo];
     document.getElementById('algoTitle').textContent = info.title;
-    document.getElementById('algoDesc').textContent  = info.desc;
+    document.getElementById('algoDesc').textContent = info.desc;
     return;
   }
   if (isRunning) return;
@@ -508,6 +508,26 @@ function selectAlgo(el, algo) {
   document.getElementById('weightSel').style.display = (algo === 'weighted_astar') ? 'block' : 'none';
   document.getElementById('beamWidthSel').style.display = (algo === 'beam') ? 'block' : 'none';
   document.getElementById('depthLimitSel').style.display = (algo === 'dls') ? 'block' : 'none';
+
+  // Lock grid size and speed for specific algorithms
+  const isLockedAlgo = (algo === 'ids' || algo === 'simulated_annealing');
+  const gridSizeBtns = document.querySelectorAll('.grid-size-btn:not(.cmp-size-btn)');
+  if (isLockedAlgo) {
+    if (gridRows !== 10 || gridCols !== 10) {
+      setGridSize(10, 10, gridSizeBtns[0]);
+    }
+    gridSizeBtns.forEach(btn => btn.disabled = true);
+    
+    const speedSlider = document.getElementById('speedSlider');
+    speedSlider.max = "3";
+    if (parseInt(speedSlider.value) > 3) {
+      speedSlider.value = "3";
+      updateSpeed(3);
+    }
+  } else {
+    gridSizeBtns.forEach(btn => btn.disabled = false);
+    document.getElementById('speedSlider').max = "5";
+  }
 
   resetStats();
   consoleLog('system', `Algoritma dipilih: ${info.title}`);
@@ -529,118 +549,226 @@ function getOrCreateWorker() {
   return algoWorker;
 }
 
-// Kill current worker and spawn a fresh one.
-// Called before every new simulation run so there is zero stale state.
 function _respawnWorker() {
   if (algoWorker) {
     algoWorker.onmessage = null;
-    algoWorker.onerror   = null;
+    algoWorker.onerror = null;
     algoWorker.terminate();
     algoWorker = null;
   }
   return getOrCreateWorker();
 }
 
-function handleWorkerMessage(e) {
+// ===================== VISUAL RENDER QUEUE =====================
+// Arsitektur:
+//   Worker  → postMessage(payload)  → onmessage enqueue ke vq[]
+//   rAF loop tunggal               → drain vq[] per frame dengan budget
+//
+// Kenapa ini menyelesaikan masalah IDDFS/IDS fullspeed:
+//   - Worker bisa mengirim ribuan pesan/detik; tanpa queue setiap pesan
+//     melahirkan 1 rAF callback sendiri → puluhan/ratusan rAF tumpuk di
+//     microtask queue → main thread kelelahan → tab freeze.
+//   - Dengan queue: semua pesan masuk buffer; SATU rAF loop mengonsumsi
+//     maks VQ_MAX_CELLS_PER_FRAME sel per frame → DOM selalu selesai dalam
+//     budget 16ms → tidak pernah freeze.
+//   - Back-pressure otomatis: kalau queue penuh (>VQ_PRESSURE_CAP)
+//     worker diminta pause → step dihitung ulang saat drain berhasil.
+
+const VQ_MAX_CELLS_PER_FRAME = 150;  // max sel dirender per frame (~60fps budget)
+const VQ_MAX_BATCHES_PER_FRAME = 6;   // max batch (pesan worker) per frame
+const VQ_PRESSURE_CAP = 80;   // jika queue > nilai ini → kirim pause ke worker
+const VQ_PRESSURE_RESUME = 20;   // resume worker saat queue turun ke nilai ini
+
+let vq = [];        // FIFO buffer payload dari worker
+let vqRafHandle = null;      // handle rAF loop aktif (null = idle)
+let vqDraining = false;     // guard spawn dobel
+let vqWorkerPaused = false;     // apakah worker sedang di-pause oleh back-pressure
+
+/**
+ * Dipanggil oleh handleWorkerMessage — hanya push ke buffer, TIDAK sentuh DOM.
+ */
+function vqEnqueue(payload) {
+  vq.push(payload);
+
+  // Back-pressure: jika buffer terlalu penuh, pause worker sementara
+  if (!vqWorkerPaused && vq.length > VQ_PRESSURE_CAP && algoWorker && isRunning && !isPaused) {
+    vqWorkerPaused = true;
+    algoWorker.postMessage({ type: 'pause' });
+  }
+
+  vqEnsureLoop();
+}
+
+/**
+ * Pastikan rAF loop berjalan — idempoten.
+ */
+function vqEnsureLoop() {
+  if (vqDraining) return;
+  vqDraining = true;
+  vqRafHandle = requestAnimationFrame(vqDrainFrame);
+}
+
+/**
+ * Loop utama — 1 panggilan per frame (~16ms).
+ * Mengonsumsi buffer dengan budget agar tidak pernah melebihi frame time.
+ */
+function vqDrainFrame() {
+  let batches = 0;
+  let cells = 0;
+
+  while (
+    vq.length > 0 &&
+    batches < VQ_MAX_BATCHES_PER_FRAME &&
+    cells < VQ_MAX_CELLS_PER_FRAME
+  ) {
+    cells += vqApplyPayload(vq.shift());
+    batches++;
+  }
+
+  // Back-pressure resume: buffer cukup rendah → beri tahu worker lanjut
+  if (vqWorkerPaused && vq.length <= VQ_PRESSURE_RESUME && algoWorker && isRunning && !isPaused) {
+    vqWorkerPaused = false;
+    algoWorker.postMessage({ type: 'resume' });
+  }
+
+  if (vq.length > 0) {
+    // Masih ada sisa — jadwalkan frame berikutnya
+    vqRafHandle = requestAnimationFrame(vqDrainFrame);
+  } else {
+    vqDraining = false;
+    vqRafHandle = null;
+  }
+}
+
+/**
+ * Terapkan satu payload ke DOM.
+ * Mengembalikan jumlah sel diproses untuk menghitung budget frame.
+ */
+function vqApplyPayload(payload) {
   const { cells, stepCount: sc, visitedCount: vc,
-          logs, info, queue, path, done } = e.data;
+    logs, info, queue, path, done } = payload;
+  let cellCount = 0;
 
-  // Batch DOM update — defer to rAF agar tidak blocking
-  requestAnimationFrame(() => {
-    // 1. Update sel yang berubah
-    if (cells && cells.length) {
-      cells.forEach(({ r, c, state }) => {
-        if (grid[r][c] === 'start' || grid[r][c] === 'goal') return;
-        grid[r][c] = state;
-        updateCellUI(r, c);
-      });
-      if (currentView === 'graph') {
-        graphNodes.forEach(n => { n.state = grid[n.r][n.c]; });
-        drawGraph();
-      }
+  // 1. Update sel grid
+  if (cells && cells.length) {
+    for (const { r, c, state } of cells) {
+      if (grid[r][c] === 'start' || grid[r][c] === 'goal') continue;
+      grid[r][c] = state;
+      updateCellUI(r, c);
+      cellCount++;
     }
+    if (currentView === 'graph') {
+      graphNodes.forEach(n => { n.state = grid[n.r][n.c]; });
+      drawGraph();
+    }
+  }
 
-    // 2. Stats
-    if (sc !== undefined) {
-      stepCount = sc;
-      document.getElementById('statSteps').textContent = sc;
-      document.getElementById('infoStep').textContent  = sc;
-    }
-    if (vc !== undefined) {
-      visitedCount = vc;
-      document.getElementById('statVisited').textContent = vc;
-    }
+  // 2. Stats
+  if (sc !== undefined) {
+    stepCount = sc;
+    document.getElementById('statSteps').textContent = sc;
+    document.getElementById('infoStep').textContent = sc;
+  }
+  if (vc !== undefined) {
+    visitedCount = vc;
+    document.getElementById('statVisited').textContent = vc;
+  }
 
-    // 3. Info panel (current node, g/h/f)
-    if (info) {
-      document.getElementById('infoCurrent').textContent = `(${info.r},${info.c})`;
-      document.getElementById('infoHn').textContent = info.h;
-      document.getElementById('infoGn').textContent = info.g;
-      document.getElementById('infoFn').textContent = Math.round((info.g + info.h) * 10) / 10;
-    }
+  // 3. Info panel
+  if (info) {
+    document.getElementById('infoCurrent').textContent = `(${info.r},${info.c})`;
+    document.getElementById('infoHn').textContent = info.h;
+    document.getElementById('infoGn').textContent = info.g;
+    document.getElementById('infoFn').textContent = Math.round((info.g + info.h) * 10) / 10;
+  }
 
-    // 4. Queue display
-    if (queue !== undefined && queue !== null) {
-      const qd = document.getElementById('queueDisplay');
-      document.getElementById('statQueue').textContent = queue.length;
-      qd.innerHTML = queue.slice(0, 12).map(k =>
-        `<div class="queue-node">${k}</div>`
-      ).join('') + (queue.length > 12 ? `<div style="font-size:9px;color:var(--text3);padding:4px">+${queue.length - 12}</div>` : '');
-    }
+  // 4. Queue display
+  if (queue !== undefined && queue !== null) {
+    const qd = document.getElementById('queueDisplay');
+    document.getElementById('statQueue').textContent = queue.length;
+    qd.innerHTML = queue.slice(0, 12).map(k =>
+      `<div class="queue-node">${k}</div>`
+    ).join('') + (queue.length > 12
+      ? `<div style="font-size:9px;color:var(--text3);padding:4px">+${queue.length - 12}</div>` : '');
+  }
 
-    // 5. Logs (batched untuk performa)
-    if (logs && logs.length) {
-      logs.forEach(({ type, msg }) => consoleLog(type, msg));
-    }
+  // 5. Logs
+  if (logs && logs.length) {
+    logs.forEach(({ type, msg }) => consoleLog(type, msg));
+  }
 
-    // 6. Path display ketika selesai
-    if (path) {
-      document.getElementById('statPath').textContent = path.length;
-      const pathDisplay = document.getElementById('pathDisplay');
-      pathDisplay.innerHTML = path.map((k, i) =>
-        `<span class="path-node">${k}</span>${i < path.length - 1 ? '<span class="path-arrow">→</span>' : ''}`
-      ).join('');
-    }
+  // 6. Path
+  if (path) {
+    document.getElementById('statPath').textContent = path.length;
+    const pathDisplay = document.getElementById('pathDisplay');
+    pathDisplay.innerHTML = path.map((k, i) =>
+      `<span class="path-node">${k}</span>${i < path.length - 1 ? '<span class="path-arrow">→</span>' : ''}`
+    ).join('');
+  }
 
-    // 7. Selesai / gagal
-    if (done) {
-      isRunning = false; isPaused = false;
-      if (isTurboMode) _setTurboUI(false); // restore turbo button
-      if (done.found) {
-        document.getElementById('infoStatus').textContent = 'Selesai ✓';
-        document.getElementById('infoStatus').style.color = 'var(--accent4)';
-        document.getElementById('infoStatus').style.background = 'rgba(52,211,153,0.12)';
-        document.getElementById('infoStatus').style.borderColor = 'rgba(52,211,153,0.4)';
-        consoleLog('success', `✓ Simulasi selesai — path ditemukan (${done.pathLen} node, ${done.steps} langkah, ${done.visited} dikunjungi)`);
-      } else {
-        document.getElementById('infoStatus').textContent = 'Gagal ✗';
-        document.getElementById('infoStatus').style.color = 'var(--accent5)';
-        document.getElementById('infoStatus').style.background = 'rgba(248,113,113,0.12)';
-        document.getElementById('infoStatus').style.borderColor = 'rgba(248,113,113,0.4)';
-        document.getElementById('statPath').textContent = '∞';
-        consoleLog('warn', `⚠ Simulasi selesai — tidak ada jalur (${done.steps} langkah, ${done.visited} dikunjungi)`);
-      }
-      updateUIControls();
+  // 7. Done / selesai
+  if (done) {
+    isRunning = false; isPaused = false;
+    vqWorkerPaused = false;
+    if (isTurboMode) _setTurboUI(false);
+    if (done.found) {
+      document.getElementById('infoStatus').textContent = 'Selesai ✓';
+      document.getElementById('infoStatus').style.color = 'var(--accent4)';
+      document.getElementById('infoStatus').style.background = 'rgba(52,211,153,0.12)';
+      document.getElementById('infoStatus').style.borderColor = 'rgba(52,211,153,0.4)';
+      consoleLog('success', `✓ Simulasi selesai — path ditemukan (${done.pathLen} node, ${done.steps} langkah, ${done.visited} dikunjungi)`);
+    } else {
+      document.getElementById('infoStatus').textContent = 'Gagal ✗';
+      document.getElementById('infoStatus').style.color = 'var(--accent5)';
+      document.getElementById('infoStatus').style.background = 'rgba(248,113,113,0.12)';
+      document.getElementById('infoStatus').style.borderColor = 'rgba(248,113,113,0.4)';
+      document.getElementById('statPath').textContent = '∞';
+      consoleLog('warn', `⚠ Simulasi selesai — tidak ada jalur (${done.steps} langkah, ${done.visited} dikunjungi)`);
     }
-  });
+    updateUIControls();
+  }
+
+  return cellCount || 1;
+}
+
+/**
+ * Buang semua item antrian dan batalkan loop rAF.
+ * Dipanggil saat stop/reset agar tidak ada update stale.
+ */
+function vqFlushAndStop() {
+  vq.length = 0;
+  if (vqRafHandle !== null) {
+    cancelAnimationFrame(vqRafHandle);
+    vqRafHandle = null;
+  }
+  vqDraining = false;
+  vqWorkerPaused = false;
+}
+
+/**
+ * handleWorkerMessage — satu-satunya titik masuk pesan dari worker.
+ * TIDAK menyentuh DOM sama sekali; hanya enqueue ke buffer.
+ */
+function handleWorkerMessage(e) {
+  vqEnqueue(e.data);
 }
 
 function sendGridToWorker() {
-  const weightVal    = parseFloat(document.getElementById('weightSel')?.value ?? '1') || 1.0;
-  const beamVal      = parseInt(document.getElementById('beamWidthSel')?.value ?? '3') || 3;
-  const depthVal     = parseInt(document.getElementById('depthLimitSel')?.value ?? '10') || 10;
+  const weightVal = parseFloat(document.getElementById('weightSel')?.value ?? '1') || 1.0;
+  const beamVal = parseInt(document.getElementById('beamWidthSel')?.value ?? '3') || 3;
+  const depthVal = parseInt(document.getElementById('depthLimitSel')?.value ?? '10') || 10;
   if (currentAlgo === 'weighted_astar') {
     consoleLog('info', `Weighted A* — bobot w=${weightVal}`);
   }
   getOrCreateWorker().postMessage({
-    type:       'init',
-    grid:       grid.map(row => [...row]),
-    rows:       gridRows,
-    cols:       gridCols,
-    algo:       currentAlgo,
-    heuristic:  currentHeuristic,
-    weight:     weightVal,
-    beamWidth:  beamVal,
+    type: 'init',
+    grid: grid.map(row => [...row]),
+    rows: gridRows,
+    cols: gridCols,
+    algo: currentAlgo,
+    heuristic: currentHeuristic,
+    weight: weightVal,
+    beamWidth: beamVal,
     depthLimit: depthVal,
     startPos,
     goalPos,
@@ -649,7 +777,8 @@ function sendGridToWorker() {
 
 function resetGridState() {
   if (isRunning) return; // Jangan reset jika sedang berjalan
-  
+  vqFlushAndStop();   // kosongkan queue sebelum reset DOM
+
   // Bersihkan jejak visual dari grid tapi biarkan dinding, start, goal
   for (let r = 0; r < gridRows; r++) {
     for (let c = 0; c < gridCols; c++) {
@@ -659,7 +788,7 @@ function resetGridState() {
       }
     }
   }
-  
+
   if (currentView === 'graph') {
     graphNodes.forEach(n => { n.state = grid[n.r][n.c]; });
     drawGraph();
@@ -668,11 +797,11 @@ function resetGridState() {
   // Matikan dan buat ulang worker agar statusnya bersih
   if (algoWorker) {
     algoWorker.onmessage = null;
-    algoWorker.onerror   = null;
+    algoWorker.onerror = null;
     algoWorker.terminate();
     algoWorker = null;
   }
-  
+
   resetStats();
   document.getElementById('infoStatus').textContent = 'Siap';
   document.getElementById('infoStatus').style.color = 'var(--text3)';
@@ -699,6 +828,7 @@ function startSimulation() {
   }
 
   // Otomatis reset visualisasi jika masih ada sisa dari simulasi sebelumnya
+  vqFlushAndStop();   // pastikan tidak ada sisa payload dari simulasi sebelumnya
   resetGridState();
 
   isRunning = true; isPaused = false;
@@ -1073,32 +1203,32 @@ function stepIDS(s, g, key) {
     if (as.maxDepth > gridRows * gridCols) return noPath();
     return false;
   }
-  
+
   const cur = as.stack.pop();
   if (cur.isBacktrack) {
     as.iterVisited.delete(key(cur.r, cur.c));
     as.actualPath.pop();
     return false;
   }
-  
+
   const { r, c, depth } = cur;
   const k = key(r, c);
-  
+
   if (as.iterVisited.has(k)) return false;
   as.iterVisited.add(k);
   as.actualPath = as.actualPath || [];
   as.actualPath.push(k);
   as.stack.push({ isBacktrack: true, r, c });
-  
+
   markCurrent(r, c); markVisited(r, c);
   consoleLog('step', `IDS[d=${depth}] → (${r},${c})`);
-  
+
   if (r === g.r && c === g.c) {
     const parentMap = {};
-    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i-1];
+    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i - 1];
     return foundGoal(parentMap, key, r, c);
   }
-  
+
   if (depth < as.maxDepth) {
     getNeighbors(r, c).reverse().forEach(n => {
       const nk = key(n.r, n.c);
@@ -1265,7 +1395,7 @@ function stepIDAStar(s, g, key) {
   const k = key(r, c);
   const f = gv + heuristic({ r, c }, g);
   if (f > as.threshold) { as.nextThreshold = Math.min(as.nextThreshold, f); return false; }
-  
+
   if (as.iterVisited.has(k)) return false;
   as.iterVisited.add(k);
   as.actualPath = as.actualPath || [];
@@ -1276,7 +1406,7 @@ function stepIDAStar(s, g, key) {
   consoleLog('step', `IDA* → (${r},${c}) g=${gv} f=${Math.round(f * 10) / 10} thresh=${Math.round(as.threshold * 10) / 10}`);
   if (r === g.r && c === g.c) {
     const parentMap = {};
-    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i-1];
+    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i - 1];
     return foundGoal(parentMap, key, r, c);
   }
   getNeighbors(r, c).reverse().forEach(n => {
@@ -1346,7 +1476,7 @@ function stepSA(s, g, key) {
   if (as.temp < 0.001) return noPath();
   if (r === g.r && c === g.c) {
     const parentMap = {};
-    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i-1];
+    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i - 1];
     return foundGoal(parentMap, key, r, c);
   }
   const nbrs = getNeighbors(r, c);
@@ -1376,7 +1506,7 @@ function stepTabu(s, g, key) {
   markCurrent(r, c); markVisited(r, c);
   if (r === g.r && c === g.c) {
     const parentMap = {};
-    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i-1];
+    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i - 1];
     return foundGoal(parentMap, key, r, c);
   }
   const nbrs = getNeighbors(r, c).filter(n => !as.tabuList.includes(key(n.r, n.c)));
@@ -1398,49 +1528,49 @@ function stepGenetic(s, g, key) {
   as.generation++;
   as.population.sort((a, b) => a.fitness - b.fitness);
   const best = as.population[0];
-  
+
   if (!as.bestEver || best.fitness < as.bestEver.fitness) {
     as.bestEver = { path: [...best.path], fitness: best.fitness };
   }
-  
+
   const displayBest = as.bestEver;
   const last = displayBest.path[displayBest.path.length - 1];
-  
+
   // Visuals
   visitedCount = as.generation * 20 * Math.floor(gridRows * gridCols * 0.05); // rough estimate
   document.getElementById('statVisited').textContent = visitedCount;
-  for (let r=0; r<gridRows; r++) for (let c=0; c<gridCols; c++) if (grid[r][c] === 'visited' || grid[r][c] === 'current' || grid[r][c] === 'queued') { grid[r][c] = 'unvisited'; updateCellUI(r, c); }
-  
+  for (let r = 0; r < gridRows; r++) for (let c = 0; c < gridCols; c++) if (grid[r][c] === 'visited' || grid[r][c] === 'current' || grid[r][c] === 'queued') { grid[r][c] = 'unvisited'; updateCellUI(r, c); }
+
   if (grid[last.r][last.c] !== 'start' && grid[last.r][last.c] !== 'goal') { grid[last.r][last.c] = 'current'; updateCellUI(last.r, last.c); }
   displayBest.path.forEach(p => {
     if (grid[p.r][p.c] !== 'start' && grid[p.r][p.c] !== 'goal') { grid[p.r][p.c] = 'visited'; updateCellUI(p.r, p.c); }
   });
   consoleLog('step', `GA Gen ${as.generation} | Best fitness: ${displayBest.fitness.toFixed(2)}`);
-  
+
   if (last.r === g.r && last.c === g.c) {
     const parentMap = {};
     for (let i = 1; i < displayBest.path.length; i++) {
-      parentMap[key(displayBest.path[i].r, displayBest.path[i].c)] = key(displayBest.path[i-1].r, displayBest.path[i-1].c);
+      parentMap[key(displayBest.path[i].r, displayBest.path[i].c)] = key(displayBest.path[i - 1].r, displayBest.path[i - 1].c);
     }
     return foundGoal(parentMap, key, last.r, last.c);
   }
-  
+
   if (as.generation >= 200) return noPath();
-  
+
   // Crossover & Mutation
   const newPop = [as.bestEver]; // Elitism
   while (newPop.length < 20) {
     const p1 = as.population[Math.floor(Math.random() * 5)]; // Select from top 5
     const p2 = as.population[Math.floor(Math.random() * 5)];
     let childPath = [];
-    
+
     // One-point crossover if paths have common nodes (other than start)
     const p2Set = new Set(p2.path.map(p => key(p.r, p.c)));
     let crossIdx = -1;
     for (let i = p1.path.length - 1; i > 0; i--) {
       if (p2Set.has(key(p1.path[i].r, p1.path[i].c))) { crossIdx = i; break; }
     }
-    
+
     if (crossIdx !== -1 && Math.random() < 0.7) { // 70% crossover rate
       const crossNode = p1.path[crossIdx];
       const p2Idx = p2.path.findIndex(p => p.r === crossNode.r && p.c === crossNode.c);
@@ -1448,7 +1578,7 @@ function stepGenetic(s, g, key) {
     } else {
       childPath = [...p1.path];
     }
-    
+
     // Mutation
     if (Math.random() < 0.3) {
       const mutIdx = Math.floor(Math.random() * childPath.length);
@@ -1464,11 +1594,11 @@ function stepGenetic(s, g, key) {
         if (cur.r === g.r && cur.c === g.c) break;
       }
     }
-    
+
     const lastChild = childPath[childPath.length - 1];
     newPop.push({ path: childPath, fitness: childPath.length + heuristic(lastChild, g) * 5 });
   }
-  
+
   as.population = newPop;
   return false;
 }
@@ -1478,7 +1608,7 @@ function stepMinimax(s, g, key) {
   const { r, c } = as.current;
   markCurrent(r, c); markVisited(r, c);
   if (r === g.r && c === g.c) return foundGoal(as.parent, key, r, c);
-  
+
   // Game tree evaluation
   const evaluate = (nr, nc, depth, isMax, pathVis) => {
     if (depth === 0 || (nr === g.r && nc === g.c)) {
@@ -1486,20 +1616,20 @@ function stepMinimax(s, g, key) {
     }
     const nbrs = getNeighbors(nr, nc).filter(n => !as.visited.has(key(n.r, n.c)) && !pathVis.has(key(n.r, n.c)));
     if (!nbrs.length) return -heuristic({ r: nr, c: nc }, g);
-    
+
     if (isMax) {
       let best = -Infinity;
-      nbrs.forEach(n => { 
+      nbrs.forEach(n => {
         pathVis.add(key(n.r, n.c));
-        best = Math.max(best, evaluate(n.r, n.c, depth - 1, false, pathVis)); 
+        best = Math.max(best, evaluate(n.r, n.c, depth - 1, false, pathVis));
         pathVis.delete(key(n.r, n.c));
       });
       return best;
     } else {
       let worst = Infinity;
-      nbrs.forEach(n => { 
+      nbrs.forEach(n => {
         pathVis.add(key(n.r, n.c));
-        worst = Math.min(worst, evaluate(n.r, n.c, depth - 1, true, pathVis)); 
+        worst = Math.min(worst, evaluate(n.r, n.c, depth - 1, true, pathVis));
         pathVis.delete(key(n.r, n.c));
       });
       return worst;
@@ -1508,7 +1638,7 @@ function stepMinimax(s, g, key) {
 
   const nbrs = getNeighbors(r, c).filter(n => !as.visited.has(key(n.r, n.c)));
   if (!nbrs.length) return noPath();
-  
+
   let bestVal = -Infinity;
   let bestNext = null;
   nbrs.forEach(n => {
@@ -1517,7 +1647,7 @@ function stepMinimax(s, g, key) {
     markQueued(n.r, n.c);
     if (val > bestVal) { bestVal = val; bestNext = n; }
   });
-  
+
   if (!bestNext) return noPath();
   as.parent[key(bestNext.r, bestNext.c)] = key(r, c);
   as.current = bestNext;
@@ -1530,14 +1660,14 @@ function stepAlphaBeta(s, g, key) {
   const { r, c } = as.current;
   markCurrent(r, c); markVisited(r, c);
   if (r === g.r && c === g.c) return foundGoal(as.parent, key, r, c);
-  
+
   const evaluateAB = (nr, nc, depth, alpha, beta, isMax, pathVis) => {
     if (depth === 0 || (nr === g.r && nc === g.c)) {
       return -heuristic({ r: nr, c: nc }, g);
     }
     const nbrs = getNeighbors(nr, nc).filter(n => !as.visited.has(key(n.r, n.c)) && !pathVis.has(key(n.r, n.c)));
     if (!nbrs.length) return -heuristic({ r: nr, c: nc }, g);
-    
+
     if (isMax) {
       let maxEval = -Infinity;
       for (let n of nbrs) {
@@ -1565,7 +1695,7 @@ function stepAlphaBeta(s, g, key) {
 
   const nbrs = getNeighbors(r, c).filter(n => !as.visited.has(key(n.r, n.c)));
   if (!nbrs.length) return noPath();
-  
+
   let bestVal = -Infinity;
   let bestNext = null;
   nbrs.forEach(n => {
@@ -1574,7 +1704,7 @@ function stepAlphaBeta(s, g, key) {
     markQueued(n.r, n.c);
     if (val > bestVal) { bestVal = val; bestNext = n; }
   });
-  
+
   if (!bestNext) return noPath();
   as.parent[key(bestNext.r, bestNext.c)] = key(r, c);
   as.current = bestNext;
@@ -1584,7 +1714,7 @@ function stepAlphaBeta(s, g, key) {
 
 function stepMCTS(s, g, key) {
   const as = algoState;
-  
+
   // Selection
   let node = as.root;
   while (node.children.length > 0 && node.children.every(c => c.visits > 0)) {
@@ -1596,7 +1726,7 @@ function stepMCTS(s, g, key) {
     }
     node = nextNode;
   }
-  
+
   // Expansion
   if (node.r !== g.r || node.c !== g.c) {
     if (node.children.length === 0 && node.visits === 0 && (node.r !== s.r || node.c !== s.c)) {
@@ -1605,8 +1735,8 @@ function stepMCTS(s, g, key) {
       if (node.children.length === 0) {
         let anc = node;
         const pathSet = new Set();
-        while(anc) { pathSet.add(key(anc.r, anc.c)); anc = anc.parentNode; }
-        
+        while (anc) { pathSet.add(key(anc.r, anc.c)); anc = anc.parentNode; }
+
         const nbrs = getNeighbors(node.r, node.c).filter(n => !pathSet.has(key(n.r, n.c)));
         node.children = nbrs.map(n => ({ r: n.r, c: n.c, parentNode: node, children: [], visits: 0, wins: 0 }));
         node.children.forEach(c => markQueued(c.r, c.c)); // Visuals
@@ -1617,7 +1747,7 @@ function stepMCTS(s, g, key) {
       }
     }
   }
-  
+
   // Simulation
   let simNode = { r: node.r, c: node.c };
   let win = 0;
@@ -1636,7 +1766,7 @@ function stepMCTS(s, g, key) {
     const startDist = heuristic(s, g);
     win = Math.max(0, 1 - (dist / startDist));
   }
-  
+
   // Backpropagation
   let cur = node;
   while (cur) {
@@ -1644,14 +1774,14 @@ function stepMCTS(s, g, key) {
     cur.wins += win;
     cur = cur.parentNode;
   }
-  
+
   as.iteration++;
   as.visited.add(key(node.r, node.c));
   markCurrent(node.r, node.c);
   markVisited(node.r, node.c);
-  
+
   consoleLog('step', `MCTS Iteration ${as.iteration} → Simulated from (${node.r},${node.c}), win=${win.toFixed(2)}`);
-  
+
   if (as.iteration >= as.maxIterations || (node.r === g.r && node.c === g.c && win === 1)) {
     // Reconstruct path
     const parentMap = {};
@@ -1682,16 +1812,16 @@ function stepBacktracking(s, g, key) {
   const as = algoState;
   if (!as.stack.length) return noPath();
   const cur = as.stack.pop();
-  
+
   if (cur.isBacktrack) {
     as.visited.delete(key(cur.r, cur.c));
     as.actualPath.pop();
     return false;
   }
-  
+
   const { r, c } = cur;
   const k = key(r, c);
-  
+
   if (as.visited.has(k)) return false;
   as.visited.add(k);
   as.actualPath = as.actualPath || [];
@@ -1702,7 +1832,7 @@ function stepBacktracking(s, g, key) {
   consoleLog('step', `BT → (${r},${c}) depth=${as.actualPath.length}`);
   if (r === g.r && c === g.c) {
     const parentMap = {};
-    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i-1];
+    for (let i = 1; i < as.actualPath.length; i++) parentMap[as.actualPath[i]] = as.actualPath[i - 1];
     return foundGoal(parentMap, key, r, c);
   }
   getNeighbors(r, c).reverse().forEach(n => {
@@ -1715,28 +1845,28 @@ function stepBacktracking(s, g, key) {
 
 function stepACO(s, g, key) {
   const as = algoState;
-  
+
   if (as.totalIterations >= 1000 || as.iteration >= 200) {
     if (as.bestPath) {
       const parentMap = {};
       for (let i = 1; i < as.bestPath.length; i++) {
-        parentMap[as.bestPath[i]] = as.bestPath[i-1];
+        parentMap[as.bestPath[i]] = as.bestPath[i - 1];
       }
-      const lastK = as.bestPath[as.bestPath.length-1];
+      const lastK = as.bestPath[as.bestPath.length - 1];
       const r = parseInt(lastK.split(',')[0]);
       const c = parseInt(lastK.split(',')[1]);
       return foundGoal(parentMap, key, r, c);
     }
     return noPath();
   }
-  
+
   let allDone = true;
   for (let ant of as.ants) {
     if (ant.done) continue;
     allDone = false;
     const cur = ant.path[ant.path.length - 1];
     const { r, c } = { r: parseInt(cur.split(',')[0]), c: parseInt(cur.split(',')[1]) };
-    
+
     if (r === g.r && c === g.c) {
       ant.done = true;
       if (!as.bestPath || ant.path.length < as.bestPath.length) {
@@ -1744,13 +1874,13 @@ function stepACO(s, g, key) {
       }
       continue;
     }
-    
+
     const nbrs = getNeighbors(r, c).filter(n => grid[n.r][n.c] !== 'wall' && !ant.visited.has(key(n.r, n.c)));
     if (!nbrs.length) {
       ant.done = true;
       continue;
     }
-    
+
     let totalProb = 0;
     const probs = [];
     nbrs.forEach(n => {
@@ -1761,7 +1891,7 @@ function stepACO(s, g, key) {
       totalProb += prob;
       probs.push({ node: n, prob });
     });
-    
+
     let nextNode = nbrs[0];
     if (totalProb > 0) {
       let rand = Math.random() * totalProb;
@@ -1770,14 +1900,14 @@ function stepACO(s, g, key) {
         if (rand <= 0) { nextNode = p.node; break; }
       }
     }
-    
+
     const nk = key(nextNode.r, nextNode.c);
     ant.path.push(nk);
     ant.visited.add(nk);
     markVisited(nextNode.r, nextNode.c);
     markCurrent(nextNode.r, nextNode.c);
   }
-  
+
   if (allDone) {
     as.iteration++;
     // Evaporation
@@ -1797,7 +1927,7 @@ function stepACO(s, g, key) {
     as.ants = Array.from({ length: 8 }, () => ({ r: s.r, c: s.c, path: [key(s.r, s.c)], visited: new Set([key(s.r, s.c)]), done: false }));
     consoleLog('step', `ACO Iteration ${as.iteration} | Best Path: ${as.bestPath ? as.bestPath.length : '-'}`);
   }
-  
+
   as.totalIterations++;
   return false;
 }
@@ -1809,30 +1939,30 @@ function stepJPS(s, g, key) {
   const cur = as.pq.shift();
   const { r, c, g: gv } = cur;
   const k = key(r, c);
-  
+
   if (as.visited.has(k)) return false;
   as.visited.add(k);
   markCurrent(r, c); markVisited(r, c);
-  
+
   consoleLog('step', `JPS → (${r},${c}) f=${Math.round(cur.f * 10) / 10}`);
   if (r === g.r && c === g.c) return foundGoal(as.parent, key, r, c);
-  
+
   const jump = (startR, startC, dr, dc) => {
     let r = startR, c = startC;
     while (true) {
       let nr = r + dr, nc = c + dc;
       if (nr < 0 || nr >= gridRows || nc < 0 || nc >= gridCols || grid[nr][nc] === 'wall') return null;
       if (nr === g.r && nc === g.c) return { r: nr, c: nc };
-      
+
       // Check for forced neighbors
       if (dr !== 0) { // Moving vertically
         if ((nc + 1 < gridCols && grid[r][nc + 1] === 'wall' && grid[nr][nc + 1] !== 'wall') ||
-            (nc - 1 >= 0 && grid[r][nc - 1] === 'wall' && grid[nr][nc - 1] !== 'wall')) {
+          (nc - 1 >= 0 && grid[r][nc - 1] === 'wall' && grid[nr][nc - 1] !== 'wall')) {
           return { r: nr, c: nc };
         }
       } else { // Moving horizontally
         if ((nr + 1 < gridRows && grid[nr + 1][c] === 'wall' && grid[nr + 1][nc] !== 'wall') ||
-            (nr - 1 >= 0 && grid[nr - 1][c] === 'wall' && grid[nr - 1][nc] !== 'wall')) {
+          (nr - 1 >= 0 && grid[nr - 1][c] === 'wall' && grid[nr - 1][nc] !== 'wall')) {
           return { r: nr, c: nc };
         }
       }
@@ -1840,7 +1970,7 @@ function stepJPS(s, g, key) {
       c = nc;
     }
   };
-  
+
   const dirs = [[0, 1], [1, 0], [0, -1], [-1, 0]];
   dirs.forEach(([dr, dc]) => {
     const jp = jump(r, c, dr, dc);
@@ -1855,7 +1985,7 @@ function stepJPS(s, g, key) {
       }
     }
   });
-  
+
   updateQueueDisplay(as.pq);
   return false;
 }
@@ -1923,13 +2053,14 @@ function stepThroughSimulation() {
 function stopSimulation() {
   isRunning = false; isPaused = false;
   clearTimeout(simulationTimer);
+  vqFlushAndStop();   // buang semua update visual yang masih antre
   resetGridState();
-  
+
   document.getElementById('btnPause').textContent = '⏸ Jeda';
   document.getElementById('infoStatus').textContent = 'Berhenti';
   document.getElementById('infoStatus').style.color = 'var(--accent5)';
   if (stepCount > 0) consoleLog('warn', 'Simulasi dihentikan di langkah ' + stepCount);
-  
+
   updateUIControls();
 }
 
@@ -1962,49 +2093,57 @@ function resetStats() {
 
 function updateUIControls() {
   const startBtn = document.getElementById('btnStart');
-  const stepBtn  = document.getElementById('btnStep');
+  const stepBtn = document.getElementById('btnStep');
   const pauseBtn = document.getElementById('btnPause');
-  const stopBtn  = document.getElementById('btnStop');
-  const heuristicSel  = document.getElementById('heuristicSel');
-  const weightSel     = document.getElementById('weightSel');
-  const beamWidthSel  = document.getElementById('beamWidthSel');
+  const stopBtn = document.getElementById('btnStop');
+  const heuristicSel = document.getElementById('heuristicSel');
+  const weightSel = document.getElementById('weightSel');
+  const beamWidthSel = document.getElementById('beamWidthSel');
   const depthLimitSel = document.getElementById('depthLimitSel');
   // Only target normal-mode grid size buttons (not compare ones)
   const gridSizeBtns = document.querySelectorAll('#rightNormal .grid-size-btn');
-  const toolBtns     = document.querySelectorAll('#canvasWrapNormal .canvas-toolbar button');
+  const toolBtns = document.querySelectorAll('#canvasWrapNormal .canvas-toolbar button');
   // Algo items in sidebar: NEVER disabled regardless of simulation state
   // (user can still browse algo info; selectAlgo guards against running state internally)
 
+  const isLockedAlgo = (currentAlgo === 'ids' || currentAlgo === 'simulated_annealing');
+
   if (!isRunning) {
     if (startBtn) startBtn.disabled = false;
-    if (stepBtn)  stepBtn.disabled  = false;
+    if (stepBtn) stepBtn.disabled = false;
     if (pauseBtn) pauseBtn.disabled = true;
-    if (stopBtn)  stopBtn.disabled  = true;
-    if (heuristicSel)  heuristicSel.disabled  = false;
-    if (weightSel)     weightSel.disabled     = false;
-    if (beamWidthSel)  beamWidthSel.disabled  = false;
+    if (stopBtn) stopBtn.disabled = true;
+    if (heuristicSel) heuristicSel.disabled = false;
+    if (weightSel) weightSel.disabled = false;
+    if (beamWidthSel) beamWidthSel.disabled = false;
     if (depthLimitSel) depthLimitSel.disabled = false;
-    gridSizeBtns.forEach(el => el.disabled = false);
+    
+    if (isLockedAlgo) {
+      gridSizeBtns.forEach(el => el.disabled = true);
+    } else {
+      gridSizeBtns.forEach(el => el.disabled = false);
+    }
+    
     toolBtns.forEach(el => el.disabled = false);
   } else if (isPaused) {
     if (startBtn) startBtn.disabled = true;
-    if (stepBtn)  stepBtn.disabled  = false;
+    if (stepBtn) stepBtn.disabled = false;
     if (pauseBtn) pauseBtn.disabled = false;
-    if (stopBtn)  stopBtn.disabled  = false;
-    if (heuristicSel)  heuristicSel.disabled  = true;
-    if (weightSel)     weightSel.disabled     = true;
-    if (beamWidthSel)  beamWidthSel.disabled  = true;
+    if (stopBtn) stopBtn.disabled = false;
+    if (heuristicSel) heuristicSel.disabled = true;
+    if (weightSel) weightSel.disabled = true;
+    if (beamWidthSel) beamWidthSel.disabled = true;
     if (depthLimitSel) depthLimitSel.disabled = true;
     gridSizeBtns.forEach(el => el.disabled = true);
     toolBtns.forEach(el => el.disabled = true);
   } else {
     if (startBtn) startBtn.disabled = true;
-    if (stepBtn)  stepBtn.disabled  = true;
+    if (stepBtn) stepBtn.disabled = true;
     if (pauseBtn) pauseBtn.disabled = false;
-    if (stopBtn)  stopBtn.disabled  = false;
-    if (heuristicSel)  heuristicSel.disabled  = true;
-    if (weightSel)     weightSel.disabled     = true;
-    if (beamWidthSel)  beamWidthSel.disabled  = true;
+    if (stopBtn) stopBtn.disabled = false;
+    if (heuristicSel) heuristicSel.disabled = true;
+    if (weightSel) weightSel.disabled = true;
+    if (beamWidthSel) beamWidthSel.disabled = true;
     if (depthLimitSel) depthLimitSel.disabled = true;
     gridSizeBtns.forEach(el => el.disabled = true);
     toolBtns.forEach(el => el.disabled = true);
@@ -2030,7 +2169,7 @@ function toggleTurboMode() {
 }
 
 function _setTurboUI(active) {
-  const btn       = document.getElementById('btnTurbo');
+  const btn = document.getElementById('btnTurbo');
   const modeBadge = document.getElementById('modeBadge');
   const tickBadge = document.getElementById('tickBadge');
 
@@ -2048,7 +2187,7 @@ function _setTurboUI(active) {
 
   if (modeBadge) {
     modeBadge.textContent = active ? '⚡ Generator' : '⚙ Generator';
-    modeBadge.className   = active ? 'gen-badge turbo' : 'gen-badge';
+    modeBadge.className = active ? 'gen-badge turbo' : 'gen-badge';
   }
   if (tickBadge) {
     tickBadge.textContent = active ? 'Turbo Batch' : 'Interval Tick';
@@ -2222,7 +2361,7 @@ let cmpTool = 'wall';
 let cmpMouseDown = false;
 
 let cmpState = {
-  A: { algo: 'bfs',   algoState: {}, running: false, done: false, found: false, steps: 0, visited: 0, pathLen: 0, queueLen: 0, startTime: 0, elapsed: 0, timer: null, grid: [], prevGrid: [] },
+  A: { algo: 'bfs', algoState: {}, running: false, done: false, found: false, steps: 0, visited: 0, pathLen: 0, queueLen: 0, startTime: 0, elapsed: 0, timer: null, grid: [], prevGrid: [] },
   B: { algo: 'astar', algoState: {}, running: false, done: false, found: false, steps: 0, visited: 0, pathLen: 0, queueLen: 0, startTime: 0, elapsed: 0, timer: null, grid: [], prevGrid: [] }
 };
 let cmpIsPaused = false;
@@ -2232,22 +2371,22 @@ let _cmpRafPending = false; // requestAnimationFrame guard
 // ----- Toggle -----
 function toggleCompareMode() {
   compareMode = !compareMode;
-  const btn             = document.getElementById('btnCompareToggle');
+  const btn = document.getElementById('btnCompareToggle');
   const compareDualWrap = document.getElementById('compareDualWrap');
-  const canvasNormal    = document.getElementById('canvasWrapNormal');
-  const rightNormal     = document.getElementById('rightNormal');
-  const rightCompare    = document.getElementById('rightCompare');
-  const statsRow        = document.getElementById('statsRowNormal');
-  const viewToggle      = document.getElementById('viewToggleNormal');
+  const canvasNormal = document.getElementById('canvasWrapNormal');
+  const rightNormal = document.getElementById('rightNormal');
+  const rightCompare = document.getElementById('rightCompare');
+  const statsRow = document.getElementById('statsRowNormal');
+  const viewToggle = document.getElementById('viewToggleNormal');
 
   if (compareMode) {
     btn.classList.add('active');
     btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="9" height="18" rx="1"/><rect x="13" y="3" width="9" height="18" rx="1"/></svg> Mode Biasa`;
     compareDualWrap.style.display = 'flex';
-    canvasNormal.style.display    = 'none';
-    rightNormal.style.display     = 'none';
-    rightCompare.style.display    = 'flex';
-    if (statsRow)   statsRow.style.display  = 'none';
+    canvasNormal.style.display = 'none';
+    rightNormal.style.display = 'none';
+    rightCompare.style.display = 'flex';
+    if (statsRow) statsRow.style.display = 'none';
     if (viewToggle) viewToggle.style.display = 'none';
     stopSimulation();
     populateCompareDropdowns();
@@ -2257,10 +2396,10 @@ function toggleCompareMode() {
     btn.classList.remove('active');
     btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="9" height="18" rx="1"/><rect x="13" y="3" width="9" height="18" rx="1"/></svg> Bandingkan`;
     compareDualWrap.style.display = 'none';
-    canvasNormal.style.display    = '';
-    rightNormal.style.display     = 'flex';
-    rightCompare.style.display    = 'none';
-    if (statsRow)   statsRow.style.display  = '';
+    canvasNormal.style.display = '';
+    rightNormal.style.display = 'flex';
+    rightCompare.style.display = 'none';
+    if (statsRow) statsRow.style.display = '';
     if (viewToggle) viewToggle.style.display = '';
     stopCompare();
     consoleLog('system', '=== Mode Biasa Aktif ===');
@@ -2294,8 +2433,8 @@ function onCompareAlgoChange() {
   cmpState.B.algo = algoB;
   document.getElementById('compareGridTitleA').textContent = ALGO_INFO[algoA]?.title || algoA;
   document.getElementById('compareGridTitleB').textContent = ALGO_INFO[algoB]?.title || algoB;
-  document.getElementById('scoreAlgoNameA').textContent    = ALGO_INFO[algoA]?.title || algoA;
-  document.getElementById('scoreAlgoNameB').textContent    = ALGO_INFO[algoB]?.title || algoB;
+  document.getElementById('scoreAlgoNameA').textContent = ALGO_INFO[algoA]?.title || algoA;
+  document.getElementById('scoreAlgoNameB').textContent = ALGO_INFO[algoB]?.title || algoB;
 }
 
 // ----- Grid init / render -----
@@ -2304,11 +2443,11 @@ function initCompareGrid() {
   cmpGrid = Array.from({ length: cmpRows }, (_, r) =>
     Array.from({ length: cmpCols }, (_, c) => {
       const v = grid[r][c];
-      return ['visited','current','queued','path'].includes(v) ? 'unvisited' : v;
+      return ['visited', 'current', 'queued', 'path'].includes(v) ? 'unvisited' : v;
     })
   );
-  cmpStartPos = startPos ? { ...startPos } : { r: Math.floor(cmpRows/2), c: 2 };
-  cmpGoalPos  = goalPos  ? { ...goalPos  } : { r: Math.floor(cmpRows/2), c: cmpCols - 3 };
+  cmpStartPos = startPos ? { ...startPos } : { r: Math.floor(cmpRows / 2), c: 2 };
+  cmpGoalPos = goalPos ? { ...goalPos } : { r: Math.floor(cmpRows / 2), c: cmpCols - 3 };
   renderCompareGrids();
 }
 
@@ -2332,11 +2471,11 @@ function _buildCmpGrid(side, containerId) {
       cell.className = `cell ${st}`;
       cell.style.cssText = `width:${cellSize}px;height:${cellSize}px`;
       if (st === 'start') cell.innerHTML = `<span style="font-size:9px">S</span>`;
-      else if (st === 'goal')  cell.innerHTML = `<span style="font-size:9px">G</span>`;
+      else if (st === 'goal') cell.innerHTML = `<span style="font-size:9px">G</span>`;
       if (!cmpState.A.running && !cmpState.B.running) {
         cell.addEventListener('mousedown', () => { cmpMouseDown = true; paintCmpCell(r, c); });
         cell.addEventListener('mouseenter', () => { if (cmpMouseDown) paintCmpCell(r, c); });
-        cell.addEventListener('mouseup',    () => { cmpMouseDown = false; });
+        cell.addEventListener('mouseup', () => { cmpMouseDown = false; });
       }
       frag.appendChild(cell);
     }
@@ -2349,7 +2488,7 @@ function _buildCmpGrid(side, containerId) {
 function _getCmpCellSize() {
   const wrap = document.getElementById('compareGridInnerA');
   if (!wrap) return 18;
-  const w = wrap.clientWidth  - 16;
+  const w = wrap.clientWidth - 16;
   const h = wrap.clientHeight - 16;
   return Math.max(10, Math.min(24, Math.floor(Math.min(w / cmpCols, h / cmpRows))));
 }
@@ -2359,9 +2498,9 @@ function _patchCmpGrid(side) {
   const containerId = side === 'A' ? 'gridContainerA' : 'gridContainerB';
   const container = document.getElementById(containerId);
   if (!container) return;
-  const cur  = cmpState[side].grid;
+  const cur = cmpState[side].grid;
   const prev = cmpState[side].prevGrid;
-  const ch   = container.children;
+  const ch = container.children;
   for (let r = 0; r < cmpRows; r++) {
     for (let c = 0; c < cmpCols; c++) {
       const idx = r * cmpCols + c;
@@ -2396,7 +2535,7 @@ function paintCmpCell(r, c) {
     cmpGrid[r][c] = 'goal';
   }
   // patch both grids from cmpGrid
-  ['A','B'].forEach(side => {
+  ['A', 'B'].forEach(side => {
     const container = document.getElementById(side === 'A' ? 'gridContainerA' : 'gridContainerB');
     if (!container) return;
     const idx = r * cmpCols + c;
@@ -2422,10 +2561,10 @@ function generateCompareMaze() {
     for (let c = 0; c < cmpCols; c++)
       if (cmpGrid[r][c] !== 'start' && cmpGrid[r][c] !== 'goal')
         cmpGrid[r][c] = Math.random() < 0.28 ? 'wall' : 'unvisited';
-  if (!cmpStartPos) cmpStartPos = { r: Math.floor(cmpRows/2), c: 2 };
-  if (!cmpGoalPos)  cmpGoalPos  = { r: Math.floor(cmpRows/2), c: cmpCols - 3 };
+  if (!cmpStartPos) cmpStartPos = { r: Math.floor(cmpRows / 2), c: 2 };
+  if (!cmpGoalPos) cmpGoalPos = { r: Math.floor(cmpRows / 2), c: cmpCols - 3 };
   cmpGrid[cmpStartPos.r][cmpStartPos.c] = 'start';
-  cmpGrid[cmpGoalPos.r][cmpGoalPos.c]   = 'goal';
+  cmpGrid[cmpGoalPos.r][cmpGoalPos.c] = 'goal';
   const clearAround = pos => {
     for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
       const nr = pos.r + dr, nc = pos.c + dc;
@@ -2442,7 +2581,7 @@ function clearCompareGrid() {
   if (cmpState.A.running || cmpState.B.running) return;
   cmpGrid = Array.from({ length: cmpRows }, () => Array(cmpCols).fill('unvisited'));
   if (cmpStartPos) cmpGrid[cmpStartPos.r][cmpStartPos.c] = 'start';
-  if (cmpGoalPos)  cmpGrid[cmpGoalPos.r][cmpGoalPos.c]   = 'goal';
+  if (cmpGoalPos) cmpGrid[cmpGoalPos.r][cmpGoalPos.c] = 'goal';
   resetCompareStats();
   renderCompareGrids();
   consoleLog('system', 'Grid komparasi dibersihkan');
@@ -2450,12 +2589,12 @@ function clearCompareGrid() {
 
 // ----- Stats -----
 function resetCompareStats() {
-  ['A','B'].forEach(s => {
+  ['A', 'B'].forEach(s => {
     cmpState[s].steps = 0; cmpState[s].visited = 0; cmpState[s].pathLen = 0;
     cmpState[s].queueLen = 0; cmpState[s].elapsed = 0;
     cmpState[s].done = false; cmpState[s].found = false;
   });
-  ['Steps','Visited','Queue','Path','Time','Eff'].forEach(m => {
+  ['Steps', 'Visited', 'Queue', 'Path', 'Time', 'Eff'].forEach(m => {
     const elA = document.getElementById(`score${m}A`);
     const elB = document.getElementById(`score${m}B`);
     if (elA) elA.textContent = (m === 'Path' || m === 'Eff') ? '-' : '0';
@@ -2477,12 +2616,12 @@ function updateCmpStatus(side, status) {
   const el = document.getElementById(`scoreStatus${side}`);
   if (!el) return;
   const map = {
-    ready:   ['Siap',       'sbadge-ready'],
-    running: ['Berjalan',   'sbadge-running'],
-    paused:  ['Dijeda',     'sbadge-paused'],
-    found:   ['Selesai ✓',  'sbadge-found'],
-    failed:  ['Gagal ✗',    'sbadge-failed'],
-    winner:  ['🏆 Juara!',  'sbadge-winner'],
+    ready: ['Siap', 'sbadge-ready'],
+    running: ['Berjalan', 'sbadge-running'],
+    paused: ['Dijeda', 'sbadge-paused'],
+    found: ['Selesai ✓', 'sbadge-found'],
+    failed: ['Gagal ✗', 'sbadge-failed'],
+    winner: ['🏆 Juara!', 'sbadge-winner'],
   };
   const [text, cls] = map[status] || map.ready;
   el.innerHTML = `<span class="sbadge ${cls}">${text}</span>`;
@@ -2500,7 +2639,7 @@ function startCompare() {
   cmpState.A.grid = cmpGrid.map(row => [...row]);
   cmpState.B.grid = cmpGrid.map(row => [...row]);
 
-  ['A','B'].forEach(side => {
+  ['A', 'B'].forEach(side => {
     const s = cmpState[side];
     s.running = true; s.done = false; s.found = false;
     s.steps = 0; s.visited = 0; s.pathLen = 0; s.queueLen = 0; s.elapsed = 0;
@@ -2515,7 +2654,7 @@ function startCompare() {
 
   document.getElementById('btnCompareStart').disabled = true;
   document.getElementById('btnComparePause').disabled = false;
-  document.getElementById('btnCompareStop').disabled  = false;
+  document.getElementById('btnCompareStop').disabled = false;
   document.getElementById('compareAlgoA').disabled = true;
   document.getElementById('compareAlgoB').disabled = true;
   document.querySelectorAll('.cmp-size-btn').forEach(b => b.disabled = true);
@@ -2529,11 +2668,11 @@ function startCompare() {
 //   Slow speeds → 1 step/tick, large delay (smooth animation)
 //   Fast speeds → many steps/tick, fixed 16ms delay (no freeze)
 const _CMP_SPEED = [
-  [1,  400],  // 1 - Sangat Lambat
-  [1,  150],  // 2 - Lambat
-  [2,   60],  // 3 - Sedang
-  [8,   16],  // 4 - Cepat
-  [32,  16],  // 5 - Sangat Cepat
+  [1, 400],  // 1 - Sangat Lambat
+  [1, 150],  // 2 - Lambat
+  [2, 60],  // 3 - Sedang
+  [8, 16],  // 4 - Cepat
+  [32, 16],  // 5 - Sangat Cepat
 ];
 
 function _scheduleCompare() {
@@ -2548,7 +2687,7 @@ function _tickCompare(stepsPerTick) {
 
   let anyStillRunning = false;
 
-  ['A','B'].forEach(side => {
+  ['A', 'B'].forEach(side => {
     const s = cmpState[side];
     if (s.done || !s.running) return;
     anyStillRunning = true;
@@ -2590,22 +2729,22 @@ function _tickCompare(stepsPerTick) {
 
 // ----- Step engine -----
 function _stepCmp(side) {
-  const s       = cmpState[side];
-  const algo    = s.algo;
-  const gR      = s.grid;          // the side's private grid array
-  const as      = s.algoState;
-  const goalP   = cmpGoalPos;
-  const rows    = cmpRows, cols = cmpCols;
+  const s = cmpState[side];
+  const algo = s.algo;
+  const gR = s.grid;          // the side's private grid array
+  const as = s.algoState;
+  const goalP = cmpGoalPos;
+  const rows = cmpRows, cols = cmpCols;
   s.steps++;
 
   const key = (r, c) => r * 1000 + c; // integer key — much faster than string concat
 
   const getN = (r, c) => {
     const out = [];
-    if (r > 0        && gR[r-1][c] !== 'wall') out.push({r: r-1, c});
-    if (r < rows - 1 && gR[r+1][c] !== 'wall') out.push({r: r+1, c});
-    if (c > 0        && gR[r][c-1] !== 'wall') out.push({r, c: c-1});
-    if (c < cols - 1 && gR[r][c+1] !== 'wall') out.push({r, c: c+1});
+    if (r > 0 && gR[r - 1][c] !== 'wall') out.push({ r: r - 1, c });
+    if (r < rows - 1 && gR[r + 1][c] !== 'wall') out.push({ r: r + 1, c });
+    if (c > 0 && gR[r][c - 1] !== 'wall') out.push({ r, c: c - 1 });
+    if (c < cols - 1 && gR[r][c + 1] !== 'wall') out.push({ r, c: c + 1 });
     return out;
   };
 
@@ -2718,13 +2857,13 @@ function _stepCmp(side) {
       if (as.vis.has(k)) return false;
       as.vis.add(k); mC(r, c); mV(r, c);
       if (r === goalP.r && c === goalP.c) return foundGoalFn(as.parent, r, c);
-      
+
       getN(r, c).forEach(n => {
         const nk = key(n.r, n.c);
         if (!as.vis.has(nk)) {
           as.parent.set(nk, key(r, c));
           const D_goal = heur(n.r, n.c);
-          
+
           const sr = cmpStartPos.r, sc = cmpStartPos.c;
           const gr = goalP.r, gc = goalP.c;
           let crossTrack = 0;
@@ -2810,7 +2949,7 @@ function _stepCmp(side) {
       mC(r, c); mV(r, c);
       if (r === goalP.r && c === goalP.c) {
         const parentMap = new Map();
-        for (let i = 1; i < as.actualPath.length; i++) parentMap.set(as.actualPath[i], as.actualPath[i-1]);
+        for (let i = 1; i < as.actualPath.length; i++) parentMap.set(as.actualPath[i], as.actualPath[i - 1]);
         parentMap.set(as.actualPath[0], -1);
         return foundGoalFn(parentMap, r, c);
       }
@@ -2851,7 +2990,7 @@ function _stepCmp(side) {
       mC(r, c); mV(r, c);
       if (r === goalP.r && c === goalP.c) {
         const parentMap = new Map();
-        for (let i = 1; i < as.actualPath.length; i++) parentMap.set(as.actualPath[i], as.actualPath[i-1]);
+        for (let i = 1; i < as.actualPath.length; i++) parentMap.set(as.actualPath[i], as.actualPath[i - 1]);
         parentMap.set(as.actualPath[0], -1);
         return foundGoalFn(parentMap, r, c);
       }
@@ -2921,7 +3060,7 @@ function _stepCmp(side) {
       if (as.temp < 0.001) return noPFn();
       if (r === goalP.r && c === goalP.c) {
         const pMap = new Map();
-        for(let i=1; i<as.actualPath.length; i++) pMap.set(as.actualPath[i], as.actualPath[i-1]);
+        for (let i = 1; i < as.actualPath.length; i++) pMap.set(as.actualPath[i], as.actualPath[i - 1]);
         pMap.set(as.actualPath[0], -1);
         return foundGoalFn(pMap, r, c);
       }
@@ -2943,7 +3082,7 @@ function _stepCmp(side) {
       mC(r, c); mV(r, c);
       if (r === goalP.r && c === goalP.c) {
         const pMap = new Map();
-        for(let i=1; i<as.actualPath.length; i++) pMap.set(as.actualPath[i], as.actualPath[i-1]);
+        for (let i = 1; i < as.actualPath.length; i++) pMap.set(as.actualPath[i], as.actualPath[i - 1]);
         pMap.set(as.actualPath[0], -1);
         return foundGoalFn(pMap, r, c);
       }
@@ -2991,7 +3130,7 @@ function _stepCmp(side) {
           const path = biMeetPath(k);
           // Build parent map from path for foundGoalFn
           const pMap = new Map();
-          path.forEach((node, i) => { if (i > 0) pMap.set(node, path[i-1]); });
+          path.forEach((node, i) => { if (i > 0) pMap.set(node, path[i - 1]); });
           pMap.set(key(cmpStartPos.r, cmpStartPos.c), -1);
           return foundGoalFn(pMap, goalP.r, goalP.c);
         }
@@ -3008,7 +3147,7 @@ function _stepCmp(side) {
         if (as.visF.has(k)) {
           const path = biMeetPath(k);
           const pMap = new Map();
-          path.forEach((node, i) => { if (i > 0) pMap.set(node, path[i-1]); });
+          path.forEach((node, i) => { if (i > 0) pMap.set(node, path[i - 1]); });
           pMap.set(key(cmpStartPos.r, cmpStartPos.c), -1);
           return foundGoalFn(pMap, goalP.r, goalP.c);
         }
@@ -3038,14 +3177,14 @@ function _stepCmp(side) {
           currNode = as.parent.get(currNode);
           if (currNode === -1 || currNode === undefined) break;
         }
-        
+
         const expandedMap = new Map();
         for (let i = 1; i < rawPath.length; i++) {
-          const r1 = Math.floor(rawPath[i-1] / 1000), c1 = rawPath[i-1] % 1000;
+          const r1 = Math.floor(rawPath[i - 1] / 1000), c1 = rawPath[i - 1] % 1000;
           const r2 = Math.floor(rawPath[i] / 1000), c2 = rawPath[i] % 1000;
           const dr = Math.sign(r2 - r1), dc = Math.sign(c2 - c1);
           let cr = r1 + dr, cc = c1 + dc;
-          let prevKey = rawPath[i-1];
+          let prevKey = rawPath[i - 1];
           while (cr !== r2 || cc !== c2) {
             const curKey = key(cr, cc);
             expandedMap.set(curKey, prevKey);
@@ -3060,22 +3199,22 @@ function _stepCmp(side) {
 
       const jump = (startR, startC, dr, dc) => {
         let cr = startR, cc = startC;
-        while(true) {
+        while (true) {
           let nr = cr + dr, nc = cc + dc;
           if (nr < 0 || nr >= rows || nc < 0 || nc >= cols || gR[nr][nc] === 'wall') return null;
           if (nr === goalP.r && nc === goalP.c) return { r: nr, c: nc };
           if (dr !== 0) {
             if ((nc + 1 < cols && gR[cr][nc + 1] === 'wall' && gR[nr][nc + 1] !== 'wall') ||
-                (nc - 1 >= 0 && gR[cr][nc - 1] === 'wall' && gR[nr][nc - 1] !== 'wall')) return { r: nr, c: nc };
+              (nc - 1 >= 0 && gR[cr][nc - 1] === 'wall' && gR[nr][nc - 1] !== 'wall')) return { r: nr, c: nc };
           } else {
             if ((nr + 1 < rows && gR[nr + 1][cc] === 'wall' && gR[nr + 1][nc] !== 'wall') ||
-                (nr - 1 >= 0 && gR[nr - 1][cc] === 'wall' && gR[nr - 1][nc] !== 'wall')) return { r: nr, c: nc };
+              (nr - 1 >= 0 && gR[nr - 1][cc] === 'wall' && gR[nr - 1][nc] !== 'wall')) return { r: nr, c: nc };
           }
           cr = nr; cc = nc;
         }
       };
 
-      const dirs = [[0,1], [1,0], [0,-1], [-1,0]];
+      const dirs = [[0, 1], [1, 0], [0, -1], [-1, 0]];
       dirs.forEach(([dr, dc]) => {
         const jp = jump(r, c, dr, dc);
         if (jp) {
@@ -3086,12 +3225,12 @@ function _stepCmp(side) {
             as.gScore.set(jpk, ng);
             as.parent.set(jpk, k);
             as.pq.push({ ...jp, g: ng, f: ng + heur(jp.r, jp.c) });
-            
+
             const dr2 = Math.sign(jp.r - r), dc2 = Math.sign(jp.c - c);
             let cr = r + dr2, cc = c + dc2;
             while (cr !== jp.r || cc !== jp.c) {
-               mV(cr, cc);
-               cr += dr2; cc += dc2;
+              mV(cr, cc);
+              cr += dr2; cc += dc2;
             }
             mQ(jp.r, jp.c);
           }
@@ -3110,7 +3249,7 @@ function _stepCmp(side) {
       mC(last.r, last.c);
       if (last.r === goalP.r && last.c === goalP.c) {
         const pMap = new Map();
-        for(let i=1; i<best.path.length; i++) pMap.set(key(best.path[i].r, best.path[i].c), key(best.path[i-1].r, best.path[i-1].c));
+        for (let i = 1; i < best.path.length; i++) pMap.set(key(best.path[i].r, best.path[i].c), key(best.path[i - 1].r, best.path[i - 1].c));
         pMap.set(key(best.path[0].r, best.path[0].c), -1);
         return foundGoalFn(pMap, last.r, last.c);
       }
@@ -3123,7 +3262,7 @@ function _stepCmp(side) {
         const pt = intersect.length > 1 ? intersect[Math.floor(Math.random() * intersect.length)] : p1.path[Math.floor(p1.path.length / 2)];
         const idx1 = p1.path.findIndex(n => n.r === pt.r && n.c === pt.c);
         let childPath = p1.path.slice(0, idx1 + 1);
-        
+
         let cur = childPath[childPath.length - 1];
         const vis = new Set(childPath.map(n => key(n.r, n.c)));
         for (let j = 0; j < 40; j++) {
@@ -3138,7 +3277,7 @@ function _stepCmp(side) {
       }
       as.population = nextGen;
       as.generation++;
-      s.visited += pop.length * 20; 
+      s.visited += pop.length * 20;
       return false;
     }
 
@@ -3146,12 +3285,12 @@ function _stepCmp(side) {
       const { r, c } = as.current;
       mC(r, c); mV(r, c);
       if (r === goalP.r && c === goalP.c) return foundGoalFn(as.parent, r, c);
-      
+
       const evaluate = (nr, nc, depth, isMax, pathVis, alpha, beta) => {
         if (depth === 0 || (nr === goalP.r && nc === goalP.c)) return -heur(nr, nc);
         const nbrs = getN(nr, nc).filter(n => !as.vis.has(key(n.r, n.c)) && !pathVis.has(key(n.r, n.c)));
         if (!nbrs.length) return -heur(nr, nc);
-        
+
         if (isMax) {
           let maxEv = -Infinity;
           for (const n of nbrs) {
@@ -3174,7 +3313,7 @@ function _stepCmp(side) {
           return minEv;
         }
       };
-      
+
       const nbrs = getN(r, c).filter(n => !as.vis.has(key(n.r, n.c)));
       if (!nbrs.length) return noPFn();
       let bestVal = -Infinity;
@@ -3211,18 +3350,18 @@ function _stepCmp(side) {
       if (node.r === goalP.r && node.c === goalP.c) {
         const pMap = new Map();
         let cur = node;
-        while(cur.parentNode) { pMap.set(key(cur.r, cur.c), key(cur.parentNode.r, cur.parentNode.c)); cur = cur.parentNode; }
+        while (cur.parentNode) { pMap.set(key(cur.r, cur.c), key(cur.parentNode.r, cur.parentNode.c)); cur = cur.parentNode; }
         pMap.set(key(cmpStartPos.r, cmpStartPos.c), -1);
         return foundGoalFn(pMap, goalP.r, goalP.c);
       }
       if (node.visits > 0 || (node.r === cmpStartPos.r && node.c === cmpStartPos.c)) {
         let anc = node;
         const pathSet = new Set();
-        while(anc) { pathSet.add(key(anc.r, anc.c)); anc = anc.parentNode; }
+        while (anc) { pathSet.add(key(anc.r, anc.c)); anc = anc.parentNode; }
         const nbrs = getN(node.r, node.c).filter(n => !pathSet.has(key(n.r, n.c)));
         node.children = nbrs.map(n => ({ r: n.r, c: n.c, parentNode: node, children: [], visits: 0, wins: 0 }));
       }
-      
+
       let simR = node.r, simC = node.c;
       const simVis = new Set([key(simR, simC)]);
       for (let step = 0; step < 40; step++) {
@@ -3235,7 +3374,7 @@ function _stepCmp(side) {
       }
       const dist = heur(simR, simC);
       const score = dist === 0 ? 1 : 1 / (1 + dist);
-      
+
       let anc = node;
       while (anc) { anc.visits++; anc.wins += score; anc = anc.parentNode; }
       return false;
@@ -3245,16 +3384,16 @@ function _stepCmp(side) {
       if (as.totalIterations >= 1000 || as.iteration >= 200) {
         if (as.bestPath) {
           const pMap = new Map();
-          for(let i=1; i<as.bestPath.length; i++) pMap.set(key(as.bestPath[i].r, as.bestPath[i].c), key(as.bestPath[i-1].r, as.bestPath[i-1].c));
+          for (let i = 1; i < as.bestPath.length; i++) pMap.set(key(as.bestPath[i].r, as.bestPath[i].c), key(as.bestPath[i - 1].r, as.bestPath[i - 1].c));
           pMap.set(key(as.bestPath[0].r, as.bestPath[0].c), -1);
-          const last = as.bestPath[as.bestPath.length-1];
+          const last = as.bestPath[as.bestPath.length - 1];
           return foundGoalFn(pMap, last.r, last.c);
         }
         return noPFn();
       }
       let allDone = true;
-      let ants = as.ants || Array(10).fill().map(() => ({ path: [{r: cmpStartPos.r, c: cmpStartPos.c}], vis: new Set([key(cmpStartPos.r, cmpStartPos.c)]), done: false, win: false }));
-      
+      let ants = as.ants || Array(10).fill().map(() => ({ path: [{ r: cmpStartPos.r, c: cmpStartPos.c }], vis: new Set([key(cmpStartPos.r, cmpStartPos.c)]), done: false, win: false }));
+
       ants.forEach(ant => {
         if (ant.done) return;
         allDone = false;
@@ -3263,7 +3402,7 @@ function _stepCmp(side) {
         if (cur.r === goalP.r && cur.c === goalP.c) { ant.done = true; ant.win = true; return; }
         const nbrs = getN(cur.r, cur.c).filter(n => !ant.vis.has(key(n.r, n.c)));
         if (!nbrs.length) { ant.done = true; return; }
-        
+
         let probs = [];
         let sum = 0;
         nbrs.forEach(n => {
@@ -3277,7 +3416,7 @@ function _stepCmp(side) {
         let rnd = Math.random() * sum;
         let next = nbrs[0];
         for (const prob of probs) { rnd -= prob.p; if (rnd <= 0) { next = prob.n; break; } }
-        
+
         ant.path.push(next);
         ant.vis.add(key(next.r, next.c));
       });
@@ -3297,25 +3436,25 @@ function _stepCmp(side) {
             }
             const deposit = 100 / len;
             for (let i = 0; i < len - 1; i++) {
-              const k = key(ant.path[i].r, ant.path[i].c) + '-' + key(ant.path[i+1].r, ant.path[i+1].c);
+              const k = key(ant.path[i].r, ant.path[i].c) + '-' + key(ant.path[i + 1].r, ant.path[i + 1].c);
               as.pheromone.set(k, (as.pheromone.get(k) || 1.0) + deposit);
             }
           }
         });
-        
+
         if (as.globalBestPath) {
           if (pathImproved) as.stagnant = 0;
           else as.stagnant = (as.stagnant || 0) + 1;
-          
+
           if (as.stagnant >= 5) {
-             const pMap = new Map();
-             for(let i=1; i<as.globalBestPath.length; i++) pMap.set(key(as.globalBestPath[i].r, as.globalBestPath[i].c), key(as.globalBestPath[i-1].r, as.globalBestPath[i-1].c));
-             pMap.set(key(as.globalBestPath[0].r, as.globalBestPath[0].c), -1);
-             const last = as.globalBestPath[as.globalBestPath.length-1];
-             return foundGoalFn(pMap, last.r, last.c);
+            const pMap = new Map();
+            for (let i = 1; i < as.globalBestPath.length; i++) pMap.set(key(as.globalBestPath[i].r, as.globalBestPath[i].c), key(as.globalBestPath[i - 1].r, as.globalBestPath[i - 1].c));
+            pMap.set(key(as.globalBestPath[0].r, as.globalBestPath[0].c), -1);
+            const last = as.globalBestPath[as.globalBestPath.length - 1];
+            return foundGoalFn(pMap, last.r, last.c);
           }
         }
-        
+
         as.iteration++;
         as.ants = null;
       }
@@ -3329,9 +3468,9 @@ function _stepCmp(side) {
 function _initCmpAlgo(algo, s, g) {
   const key = (r, c) => r * 1000 + c;
   const as = {
-    vis:     new Set(),
-    parent:  new Map(),   // int key → int parent key (-1 = start sentinel)
-    gScore:  new Map(),
+    vis: new Set(),
+    parent: new Map(),   // int key → int parent key (-1 = start sentinel)
+    gScore: new Map(),
     costMap: new Map(),
     queue: [], pq: [], stack: []
   };
@@ -3437,11 +3576,11 @@ function _initCmpAlgo(algo, s, g) {
 function _updateCmpScoreboard(side) {
   const s = cmpState[side];
   const get = id => document.getElementById(id);
-  get(`scoreSteps${side}`).textContent   = s.steps;
+  get(`scoreSteps${side}`).textContent = s.steps;
   get(`scoreVisited${side}`).textContent = s.visited;
-  get(`scoreQueue${side}`).textContent   = s.queueLen;
-  get(`scorePath${side}`).textContent    = s.pathLen || '-';
-  get(`scoreTime${side}`).textContent    = Math.round(s.elapsed);
+  get(`scoreQueue${side}`).textContent = s.queueLen;
+  get(`scorePath${side}`).textContent = s.pathLen || '-';
+  get(`scoreTime${side}`).textContent = Math.round(s.elapsed);
   const eff = (s.visited > 0 && s.pathLen > 0)
     ? (s.pathLen / s.visited * 100).toFixed(1) + '%' : '-';
   get(`scoreEff${side}`).textContent = eff;
@@ -3461,7 +3600,7 @@ function _markLeader(side) {
   const other = side === 'A' ? 'B' : 'A';
   updateCmpStatus(other, cmpState[other].running ? 'running' : 'found');
   const algoName = ALGO_INFO[cmpState[side].algo]?.title || cmpState[side].algo;
-  const color    = side === 'A' ? 'var(--accent)' : 'var(--accent2)';
+  const color = side === 'A' ? 'var(--accent)' : 'var(--accent2)';
   document.getElementById('scoreboardWinner').innerHTML =
     `<span style="color:${color}">▲ ${algoName}</span> 🏆 Pertama Selesai!`;
   document.getElementById(`compareBadge${side}`).innerHTML =
@@ -3488,8 +3627,8 @@ function _finishCompare() {
   updateCmpStatus('B', statusFor(B, A));
 
   // Highlight winning metrics
-  [['Steps','scoreStepsA','scoreStepsB'], ['Visited','scoreVisitedA','scoreVisitedB'],
-   ['Path','scorePathA','scorePathB'],    ['Time','scoreTimeA','scoreTimeB']
+  [['Steps', 'scoreStepsA', 'scoreStepsB'], ['Visited', 'scoreVisitedA', 'scoreVisitedB'],
+  ['Path', 'scorePathA', 'scorePathB'], ['Time', 'scoreTimeA', 'scoreTimeB']
   ].forEach(([, kA, kB]) => {
     const va = parseFloat(document.getElementById(kA).textContent) || Infinity;
     const vb = parseFloat(document.getElementById(kB).textContent) || Infinity;
@@ -3500,18 +3639,18 @@ function _finishCompare() {
   // Summary
   let summary = '';
   if (A.found && B.found) {
-    if      (A.pathLen < B.pathLen) summary = `<span style="color:var(--accent)">▲ ${ALGO_INFO[A.algo]?.title}</span> unggul — path lebih pendek (${A.pathLen} vs ${B.pathLen})`;
+    if (A.pathLen < B.pathLen) summary = `<span style="color:var(--accent)">▲ ${ALGO_INFO[A.algo]?.title}</span> unggul — path lebih pendek (${A.pathLen} vs ${B.pathLen})`;
     else if (B.pathLen < A.pathLen) summary = `<span style="color:var(--accent2)">▲ ${ALGO_INFO[B.algo]?.title}</span> unggul — path lebih pendek (${B.pathLen} vs ${A.pathLen})`;
-    else                             summary = `⚖️ Seri! Panjang path sama (${A.pathLen} node)`;
+    else summary = `⚖️ Seri! Panjang path sama (${A.pathLen} node)`;
   } else if (A.found) summary = `<span style="color:var(--accent)">▲ ${ALGO_INFO[A.algo]?.title}</span> menang — B gagal menemukan jalur`;
-  else if (B.found)   summary = `<span style="color:var(--accent2)">▲ ${ALGO_INFO[B.algo]?.title}</span> menang — A gagal menemukan jalur`;
-  else                summary = `❌ Kedua algoritma gagal menemukan jalur`;
+  else if (B.found) summary = `<span style="color:var(--accent2)">▲ ${ALGO_INFO[B.algo]?.title}</span> menang — A gagal menemukan jalur`;
+  else summary = `❌ Kedua algoritma gagal menemukan jalur`;
   document.getElementById('scoreboardWinner').innerHTML = summary;
 
   // Re-enable controls
   document.getElementById('btnCompareStart').disabled = false;
   document.getElementById('btnComparePause').disabled = true;
-  document.getElementById('btnCompareStop').disabled  = true;
+  document.getElementById('btnCompareStop').disabled = true;
   document.getElementById('compareAlgoA').disabled = false;
   document.getElementById('compareAlgoB').disabled = false;
   document.querySelectorAll('.cmp-size-btn').forEach(b => b.disabled = false);
@@ -3547,7 +3686,7 @@ function stopCompare() {
   document.getElementById('btnCompareStart').disabled = false;
   document.getElementById('btnComparePause').disabled = true;
   document.getElementById('btnComparePause').textContent = '⏸ Jeda';
-  document.getElementById('btnCompareStop').disabled  = true;
+  document.getElementById('btnCompareStop').disabled = true;
   document.getElementById('compareAlgoA').disabled = false;
   document.getElementById('compareAlgoB').disabled = false;
   document.querySelectorAll('.cmp-size-btn').forEach(b => b.disabled = false);
@@ -3568,9 +3707,9 @@ function setCmpGridSize(r, c, btn) {
   cmpRows = r; cmpCols = c;
   cmpGrid = Array.from({ length: r }, () => Array(c).fill('unvisited'));
   cmpStartPos = { r: Math.floor(r / 2), c: 2 };
-  cmpGoalPos  = { r: Math.floor(r / 2), c: c - 3 };
+  cmpGoalPos = { r: Math.floor(r / 2), c: c - 3 };
   cmpGrid[cmpStartPos.r][cmpStartPos.c] = 'start';
-  cmpGrid[cmpGoalPos.r][cmpGoalPos.c]   = 'goal';
+  cmpGrid[cmpGoalPos.r][cmpGoalPos.c] = 'goal';
   resetCompareStats();
   renderCompareGrids();
   consoleLog('system', `Grid komparasi: ${r}×${c}`);
@@ -3583,15 +3722,19 @@ window.addEventListener('resize', () => {
 // ─── Theme-aware 3D color helper (override) ───────────────────────────
 function get3DColorThemed(state) {
   const isLight = document.body.classList.contains('theme-light');
-  const isWarm  = document.body.classList.contains('theme-warm');
+  const isWarm = document.body.classList.contains('theme-warm');
   if (isLight) {
-    const c = { unvisited:'#dde4ef', wall:'#6d28d9', start:'#16a34a', goal:'#7c3aed',
-      visited:'#86efac', current:'#0284c7', queued:'#fbbf24', path:'#ea580c' };
+    const c = {
+      unvisited: '#dde4ef', wall: '#6d28d9', start: '#16a34a', goal: '#7c3aed',
+      visited: '#86efac', current: '#0284c7', queued: '#fbbf24', path: '#ea580c'
+    };
     return c[state] || c.unvisited;
   }
   if (isWarm) {
-    const c = { unvisited:'#2e2018', wall:'#7c2d12', start:'#22c55e', goal:'#f97316',
-      visited:'#064e3b', current:'#fbbf24', queued:'#92400e', path:'#84cc16' };
+    const c = {
+      unvisited: '#2e2018', wall: '#7c2d12', start: '#22c55e', goal: '#f97316',
+      visited: '#064e3b', current: '#fbbf24', queued: '#92400e', path: '#84cc16'
+    };
     return c[state] || c.unvisited;
   }
   return get3DColor(state);
