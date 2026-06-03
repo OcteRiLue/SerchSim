@@ -7,6 +7,7 @@ let gridRows = 15, gridCols = 20;
 let grid = [];
 let startPos = null, goalPos = null;
 let isRunning = false, isPaused = false;
+let isTurboMode = false;     // ← Turbo Mode: Web Worker tanpa delay
 let simulationTimer = null;
 let stepCount = 0, visitedCount = 0;
 let speedMs = 80;
@@ -115,6 +116,9 @@ function paintCell(r, c) {
     grid[r][c] = 'goal';
   }
   updateCellUI(r, c);
+
+  // Notifikasi worker agar grid-nya sinkron
+  if (algoWorker) algoWorker.postMessage({ type: 'gridUpdate', cells: [{ r, c, state: grid[r][c] }], startPos, goalPos });
 }
 
 function updateCellUI(r, c) {
@@ -286,7 +290,7 @@ function render3D(ctx, W, H) {
 
   renderList.forEach(cell => {
     const { r, c, state, hLevel } = cell;
-    const col = get3DColor(state);
+    const col = get3DColorThemed(state);
 
     const v = [];
     for (let dz of [0, hLevel]) {
@@ -470,32 +474,218 @@ function selectAlgo(el, algo) {
   consoleLog('info', `Tipe: ${info.type} | ${info.desc.substring(0, 80)}...`);
 }
 
+// ===================== WEB WORKER =====================
+let algoWorker = null;
+
+function getOrCreateWorker() {
+  if (algoWorker) return algoWorker;
+  algoWorker = new Worker('algo-worker.js');
+  algoWorker.onmessage = handleWorkerMessage;
+  algoWorker.onerror = (e) => {
+    consoleLog('error', `Worker error: ${e.message}`);
+    isRunning = false; isPaused = false;
+    updateUIControls();
+    _scheduleAutoReset();
+  };
+  return algoWorker;
+}
+
+// Kill current worker and spawn a fresh one.
+// Called before every new simulation run so there is zero stale state.
+function _respawnWorker() {
+  if (algoWorker) {
+    algoWorker.onmessage = null;
+    algoWorker.onerror   = null;
+    algoWorker.terminate();
+    algoWorker = null;
+  }
+  return getOrCreateWorker();
+}
+
+function handleWorkerMessage(e) {
+  const { cells, stepCount: sc, visitedCount: vc,
+          logs, info, queue, path, done } = e.data;
+
+  // Batch DOM update — defer to rAF agar tidak blocking
+  requestAnimationFrame(() => {
+    // 1. Update sel yang berubah
+    if (cells && cells.length) {
+      cells.forEach(({ r, c, state }) => {
+        if (grid[r][c] === 'start' || grid[r][c] === 'goal') return;
+        grid[r][c] = state;
+        updateCellUI(r, c);
+      });
+    }
+
+    // 2. Stats
+    if (sc !== undefined) {
+      stepCount = sc;
+      document.getElementById('statSteps').textContent = sc;
+      document.getElementById('infoStep').textContent  = sc;
+    }
+    if (vc !== undefined) {
+      visitedCount = vc;
+      document.getElementById('statVisited').textContent = vc;
+    }
+
+    // 3. Info panel (current node, g/h/f)
+    if (info) {
+      document.getElementById('infoCurrent').textContent = `(${info.r},${info.c})`;
+      document.getElementById('infoHn').textContent = info.h;
+      document.getElementById('infoGn').textContent = info.g;
+      document.getElementById('infoFn').textContent = Math.round((info.g + info.h) * 10) / 10;
+    }
+
+    // 4. Queue display
+    if (queue !== undefined && queue !== null) {
+      const qd = document.getElementById('queueDisplay');
+      document.getElementById('statQueue').textContent = queue.length;
+      qd.innerHTML = queue.slice(0, 12).map(k =>
+        `<div class="queue-node">${k}</div>`
+      ).join('') + (queue.length > 12 ? `<div style="font-size:9px;color:var(--text3);padding:4px">+${queue.length - 12}</div>` : '');
+    }
+
+    // 5. Logs (batched untuk performa)
+    if (logs && logs.length) {
+      logs.forEach(({ type, msg }) => consoleLog(type, msg));
+    }
+
+    // 6. Path display ketika selesai
+    if (path) {
+      document.getElementById('statPath').textContent = path.length;
+      const pathDisplay = document.getElementById('pathDisplay');
+      pathDisplay.innerHTML = path.map((k, i) =>
+        `<span class="path-node">${k}</span>${i < path.length - 1 ? '<span class="path-arrow">→</span>' : ''}`
+      ).join('');
+    }
+
+    // 7. Selesai / gagal
+    if (done) {
+      isRunning = false; isPaused = false;
+      if (isTurboMode) _setTurboUI(false); // restore turbo button
+      if (done.found) {
+        document.getElementById('infoStatus').textContent = 'Selesai ✓';
+        document.getElementById('infoStatus').style.color = 'var(--accent4)';
+        document.getElementById('infoStatus').style.background = 'rgba(52,211,153,0.12)';
+        document.getElementById('infoStatus').style.borderColor = 'rgba(52,211,153,0.4)';
+        consoleLog('success', `✓ Simulasi selesai — path ditemukan (${done.pathLen} node, ${done.steps} langkah, ${done.visited} dikunjungi)`);
+      } else {
+        document.getElementById('infoStatus').textContent = 'Gagal ✗';
+        document.getElementById('infoStatus').style.color = 'var(--accent5)';
+        document.getElementById('infoStatus').style.background = 'rgba(248,113,113,0.12)';
+        document.getElementById('infoStatus').style.borderColor = 'rgba(248,113,113,0.4)';
+        document.getElementById('statPath').textContent = '∞';
+        consoleLog('warn', `⚠ Simulasi selesai — tidak ada jalur (${done.steps} langkah, ${done.visited} dikunjungi)`);
+      }
+      updateUIControls();
+      if (currentView === 'graph') initGraphView();
+      // Auto-reset worker state so next run starts clean
+      _scheduleAutoReset();
+    }
+  });
+}
+
+function sendGridToWorker() {
+  const weightVal    = parseFloat(document.getElementById('weightSel')?.value ?? '1') || 1.0;
+  const beamVal      = parseInt(document.getElementById('beamWidthSel')?.value ?? '3') || 3;
+  const depthVal     = parseInt(document.getElementById('depthLimitSel')?.value ?? '10') || 10;
+  if (currentAlgo === 'weighted_astar') {
+    consoleLog('info', `Weighted A* — bobot w=${weightVal}`);
+  }
+  getOrCreateWorker().postMessage({
+    type:       'init',
+    grid:       grid.map(row => [...row]),
+    rows:       gridRows,
+    cols:       gridCols,
+    algo:       currentAlgo,
+    heuristic:  currentHeuristic,
+    weight:     weightVal,
+    beamWidth:  beamVal,
+    depthLimit: depthVal,
+    startPos,
+    goalPos,
+  });
+}
+
+// Auto-reset: after simulation ends (success/fail/stuck), reset worker + UI
+// so user can immediately switch algo and run again without manual reset.
+function _scheduleAutoReset() {
+  // Short delay so user can read the result, then silently clean up worker state
+  setTimeout(() => {
+    // Only reset if still not running (user hasn't clicked Start again)
+    if (!isRunning && !isPaused) {
+      // Clear visual trail from grid but keep walls + start + goal
+      for (let r = 0; r < gridRows; r++)
+        for (let c = 0; c < gridCols; c++)
+          if (['visited', 'current', 'queued', 'path'].includes(grid[r][c])) {
+            grid[r][c] = 'unvisited';
+            updateCellUI(r, c);
+          }
+      // Terminate + respawn worker so it's fully fresh for next algo
+      if (algoWorker) {
+        algoWorker.onmessage = null;
+        algoWorker.onerror   = null;
+        algoWorker.terminate();
+        algoWorker = null;
+      }
+      resetStats();
+      document.getElementById('infoStatus').textContent = 'Siap';
+      document.getElementById('infoStatus').style.color = 'var(--text3)';
+      consoleLog('system', '— Grid direset, siap untuk simulasi berikutnya —');
+    }
+  }, 2200); // 2.2s delay: cukup untuk baca hasil, tapi tidak terlalu lama
+}
+
+
 // ===================== SIMULATION ENGINE =====================
 function startSimulation() {
   if (!startPos || !goalPos) { consoleLog('error', 'Start/Goal belum ditentukan!'); return; }
   if (isRunning && !isPaused) return;
-  if (isPaused) { isPaused = false; document.getElementById('infoStatus').textContent = 'Berjalan'; document.getElementById('infoStatus').style.color = 'var(--accent4)'; updateUIControls(); runNextStep(); return; }
 
-  // Reset visited cells
+  // Resume dari jeda
+  if (isPaused) {
+    isPaused = false;
+    document.getElementById('infoStatus').textContent = 'Berjalan';
+    document.getElementById('infoStatus').style.color = 'var(--accent4)';
+    const speedVal = parseInt(document.getElementById('speedSlider').value);
+    const w = getOrCreateWorker();
+    w.postMessage({ type: 'speed', value: speedVal });
+    if (isTurboMode) w.postMessage({ type: 'turbo', enabled: true });
+    w.postMessage({ type: 'resume' });
+    updateUIControls();
+    return;
+  }
+
+  // Reset sel yang divisualisasikan
   for (let r = 0; r < gridRows; r++)
     for (let c = 0; c < gridCols; c++)
-      if (['visited', 'current', 'queued', 'path'].includes(grid[r][c])) { grid[r][c] = 'unvisited'; updateCellUI(r, c); }
+      if (['visited', 'current', 'queued', 'path'].includes(grid[r][c])) {
+        grid[r][c] = 'unvisited'; updateCellUI(r, c);
+      }
 
   isRunning = true; isPaused = false;
   stepCount = 0; visitedCount = 0;
   resetStats();
 
-  document.getElementById('infoStatus').textContent = 'Berjalan';
-  document.getElementById('infoStatus').style.color = 'var(--accent4)';
+  document.getElementById('infoStatus').textContent = isTurboMode ? '⚡ Turbo' : '▶ Berjalan';
+  document.getElementById('infoStatus').style.color = isTurboMode ? 'var(--accent3)' : 'var(--accent4)';
+  document.getElementById('infoStatus').style.background = isTurboMode ? 'rgba(251,191,36,0.12)' : 'rgba(52,211,153,0.1)';
+  document.getElementById('infoStatus').style.borderColor = isTurboMode ? 'rgba(251,191,36,0.35)' : 'rgba(52,211,153,0.3)';
 
-  consoleLog('system', `=== Memulai ${ALGO_INFO[currentAlgo].title} ===`);
+  const modeLabel = isTurboMode ? ' [⚡ TURBO]' : ' [Generator]';
+  consoleLog('system', `=== Memulai ${ALGO_INFO[currentAlgo].title}${modeLabel} ===`);
   consoleLog('info', `Start: (${startPos.r},${startPos.c}) | Goal: (${goalPos.r},${goalPos.c})`);
   consoleLog('info', `Grid: ${gridRows}×${gridCols} | Heuristik: ${currentHeuristic}`);
 
-  // Init algorithm-specific structures
-  initAlgorithm();
+  // Always spawn a fresh worker so no stale generator state carries over
+  const w = _respawnWorker();
+  sendGridToWorker();
+  const speedVal = parseInt(document.getElementById('speedSlider').value);
+  w.postMessage({ type: 'speed', value: speedVal });
+  if (isTurboMode) w.postMessage({ type: 'turbo', enabled: true });
+  w.postMessage({ type: 'start' });
+
   updateUIControls();
-  runNextStep();
 }
 
 // Algorithm state
@@ -539,7 +729,10 @@ function initAlgorithm() {
       algoState.visitedF = new Set([key(s.r, s.c)]);
       algoState.visitedB = new Set([key(g.r, g.c)]);
       algoState.parentF = {}; algoState.parentB = {};
+      algoState.parentF[key(s.r, s.c)] = null;
+      algoState.parentB[key(g.r, g.c)] = null;
       algoState.direction = 'forward';
+      algoState._biInitDone = true;
       break;
     case 'greedy':
       algoState.pq = [{ r: s.r, c: s.c, h: heuristic(s, g) }];
@@ -639,49 +832,16 @@ function generatePopulation(s, g, size) {
   return pop;
 }
 
-function runNextStep() {
-  if (!isRunning || isPaused) return;
-  const done = stepAlgorithm();
-  if (!done) {
-    const delay = [300, 150, 80, 30, 5][parseInt(document.getElementById('speedSlider').value) - 1];
-    simulationTimer = setTimeout(runNextStep, delay);
-  }
-}
+// runNextStep: no-op — logika dipindah ke algo-worker.js (background thread)
+function runNextStep() { /* worker mengurus tick */ }
 
+// stepAlgorithm: dipindah ke algo-worker.js (background thread)
+// Stub ini hanya dipakai oleh stepThroughSimulation (mode langkah manual)
 function stepAlgorithm() {
-  const s = startPos, g = goalPos;
-  const key = (r, c) => `${r},${c}`;
-
-  stepCount++;
-  document.getElementById('statSteps').textContent = stepCount;
-  document.getElementById('infoStep').textContent = stepCount;
-
-  switch (currentAlgo) {
-    case 'garislintang': return stepGarisLintang(s, g, key);
-    case 'bfs': return stepBFS(s, g, key);
-    case 'dfs': return stepDFS(s, g, key);
-    case 'dls': return stepDLS(s, g, key);
-    case 'ids': return stepIDS(s, g, key);
-    case 'ucs': return stepUCS(s, g, key);
-    case 'bidirectional': return stepBiDir(s, g, key);
-    case 'greedy': return stepGreedy(s, g, key);
-    case 'astar': return stepAStar(s, g, key, false);
-    case 'weighted_astar': return stepAStar(s, g, key, true);
-    case 'idastar': return stepIDAStar(s, g, key);
-    case 'beam': return stepBeam(s, g, key);
-    case 'hillclimbing': return stepHC(s, g, key, false);
-    case 'steepest': return stepHC(s, g, key, true);
-    case 'simulated_annealing': return stepSA(s, g, key);
-    case 'tabu': return stepTabu(s, g, key);
-    case 'genetic': return stepGenetic(s, g, key);
-    case 'minimax': return stepMinimax(s, g, key);
-    case 'alphabeta': return stepAlphaBeta(s, g, key);
-    case 'mcts': return stepMCTS(s, g, key);
-    case 'backtracking': return stepBacktracking(s, g, key);
-    case 'ants': return stepACO(s, g, key);
-    case 'jps': return stepJPS(s, g, key);
-    default: return stepBFS(s, g, key);
+  if (algoWorker && isRunning) {
+    algoWorker.postMessage({ type: 'step' });
   }
+  return false;
 }
 
 function getNeighbors(r, c, diagonal = false) {
@@ -784,7 +944,7 @@ function stepGarisLintang(s, g, key) {
   getNeighbors(r, c).forEach(n => {
     const nk = key(n.r, n.c);
     const ng = gv + 1;
-    if (!as.gScore[nk] || ng < as.gScore[nk]) {
+    if (as.gScore[nk] === undefined || ng < as.gScore[nk]) {
       as.gScore[nk] = ng; as.parent[nk] = key(r, c);
 
       // Calculate f = D_goal + k * T
@@ -927,7 +1087,7 @@ function stepUCS(s, g, key) {
   getNeighbors(r, c).forEach(n => {
     const nk = key(n.r, n.c);
     const newCost = cost + 1;
-    if (!costMap[nk] || newCost < costMap[nk]) { costMap[nk] = newCost; parent[nk] = key(r, c); pq.push({ ...n, cost: newCost }); markQueued(n.r, n.c); }
+    if (costMap[nk] === undefined || newCost < costMap[nk]) { costMap[nk] = newCost; parent[nk] = key(r, c); pq.push({ ...n, cost: newCost }); markQueued(n.r, n.c); }
   });
   updateQueueDisplay(pq);
   return false;
@@ -940,6 +1100,14 @@ function stepBiDir(s, g, key) {
   const vis = isForward ? as.visitedF : as.visitedB;
   const visOther = isForward ? as.visitedB : as.visitedF;
   const par = isForward ? as.parentF : as.parentB;
+
+  // Init sentinel values if not set
+  if (!as._biInitDone) {
+    as.parentF[key(s.r, s.c)] = null;
+    as.parentB[key(g.r, g.c)] = null;
+    as._biInitDone = true;
+  }
+
   if (!q.length) {
     if ((isForward ? as.queueB : as.queueF).length) { as.direction = isForward ? 'backward' : 'forward'; return false; }
     return noPath();
@@ -950,16 +1118,37 @@ function stepBiDir(s, g, key) {
   consoleLog('step', `Bi-BFS [${isForward ? '→' : '←'}] → (${r},${c})`);
   if (visOther.has(k)) {
     consoleLog('success', `Pertemuan di (${r},${c})!`);
-    // Merge path: start → meeting via parentF, meeting → goal via parentB
-    const mergedParent = {};
+    // Build path: trace from meetPoint to start via parentF
+    const pathToMeet = [];
     let curF = k;
-    while (curF && as.parentF[curF]) { mergedParent[curF] = as.parentF[curF]; curF = as.parentF[curF]; }
-    let curB = k;
-    while (curB && as.parentB[curB]) {
-      mergedParent[as.parentB[curB]] = curB;
+    while (curF !== null && curF !== undefined) {
+      pathToMeet.unshift(curF);
+      curF = as.parentF[curF];
+    }
+    // trace from meetPoint to goal via parentB
+    const pathFromMeet = [];
+    let curB = as.parentB[k];
+    while (curB !== null && curB !== undefined) {
+      pathFromMeet.push(curB);
       curB = as.parentB[curB];
     }
-    return foundGoal(mergedParent, key, g.r, g.c);
+    const fullPath = [...pathToMeet, ...pathFromMeet];
+
+    // Draw full path
+    fullPath.forEach(pk => {
+      const [pr, pc] = pk.split(',').map(Number);
+      if (grid[pr][pc] !== 'start' && grid[pr][pc] !== 'goal') { grid[pr][pc] = 'path'; updateCellUI(pr, pc); }
+    });
+    document.getElementById('statPath').textContent = fullPath.length;
+    document.getElementById('infoStatus').textContent = 'Selesai ✓';
+    document.getElementById('infoStatus').style.color = 'var(--accent4)';
+    const pathDisplay = document.getElementById('pathDisplay');
+    pathDisplay.innerHTML = fullPath.map((pk, i) => `<span class="path-node">${pk}</span>${i < fullPath.length - 1 ? '<span class="path-arrow">→</span>' : ''}`).join('');
+    consoleLog('success', `✓ Bi-BFS path ditemukan! Panjang: ${fullPath.length} node`);
+    consoleLog('path', `Path: ${fullPath.join(' → ')}`);
+    isRunning = false;
+    updateUIControls();
+    return true;
   }
   getNeighbors(r, c).forEach(n => {
     const nk = key(n.r, n.c);
@@ -1007,7 +1196,7 @@ function stepAStar(s, g, key, weighted) {
   getNeighbors(r, c).forEach(n => {
     const nk = key(n.r, n.c);
     const ng = gv + 1;
-    if (!as.gScore[nk] || ng < as.gScore[nk]) {
+    if (as.gScore[nk] === undefined || ng < as.gScore[nk]) {
       as.gScore[nk] = ng; as.parent[nk] = key(r, c);
       as.pq.push({ ...n, g: ng, f: ng + w * heuristic(n, g) });
       markQueued(n.r, n.c);
@@ -1622,7 +1811,7 @@ function stepJPS(s, g, key) {
     if (jp) {
       const jpk = key(jp.r, jp.c);
       const ng = gv + Math.abs(jp.r - r) + Math.abs(jp.c - c);
-      if (!as.gScore[jpk] || ng < as.gScore[jpk]) {
+      if (as.gScore[jpk] === undefined || ng < as.gScore[jpk]) {
         as.gScore[jpk] = ng;
         as.parent[jpk] = key(r, c);
         as.pq.push({ ...jp, g: ng, f: ng + heuristic(jp, g) });
@@ -1642,16 +1831,21 @@ function pauseSimulation() {
   clearTimeout(simulationTimer);
   const btn = document.getElementById('btnPause');
   if (isPaused) {
-    btn.textContent = '▶ Lanjut';
+    btn.textContent = '\u25b6 Lanjut';
     document.getElementById('infoStatus').textContent = 'Dijeda';
     document.getElementById('infoStatus').style.color = 'var(--accent3)';
     consoleLog('warn', 'Simulasi dijeda');
+    if (algoWorker) algoWorker.postMessage({ type: 'pause' });
   } else {
-    btn.textContent = '⏸ Jeda';
+    btn.textContent = '\u23f8 Jeda';
     document.getElementById('infoStatus').textContent = 'Berjalan';
     document.getElementById('infoStatus').style.color = 'var(--accent4)';
     consoleLog('info', 'Simulasi dilanjutkan');
-    runNextStep();
+    if (algoWorker) {
+      const speedVal = parseInt(document.getElementById('speedSlider').value);
+      algoWorker.postMessage({ type: 'speed', value: speedVal });
+      algoWorker.postMessage({ type: 'resume' });
+    }
   }
   updateUIControls();
 }
@@ -1664,35 +1858,52 @@ function stepThroughSimulation() {
       for (let c = 0; c < gridCols; c++)
         if (['visited', 'current', 'queued', 'path'].includes(grid[r][c])) { grid[r][c] = 'unvisited'; updateCellUI(r, c); }
 
-    isRunning = true;
-    isPaused = true;
+    isRunning = true; isPaused = true;
     stepCount = 0; visitedCount = 0;
     resetStats();
-
     document.getElementById('infoStatus').textContent = 'Dijeda (Langkah)';
     document.getElementById('infoStatus').style.color = 'var(--accent3)';
+    consoleLog('system', '=== Memulai ' + ALGO_INFO[currentAlgo].title + ' (Langkah-per-Langkah) ===');
 
-    consoleLog('system', `=== Memulai ${ALGO_INFO[currentAlgo].title} (Langkah-per-Langkah) ===`);
-    initAlgorithm();
+    // Always spawn a fresh worker so no stale generator carries over
+    _respawnWorker();
+    sendGridToWorker();
+    algoWorker.postMessage({ type: 'speed', value: 1 });
+    // Worker di-pause, belum start
   } else {
     isPaused = true;
     clearTimeout(simulationTimer);
-    document.getElementById('btnPause').textContent = '▶ Lanjut';
+    if (algoWorker) algoWorker.postMessage({ type: 'pause' });
+    document.getElementById('btnPause').textContent = '\u25b6 Lanjut';
     document.getElementById('infoStatus').textContent = 'Dijeda (Langkah)';
     document.getElementById('infoStatus').style.color = 'var(--accent3)';
   }
 
   updateUIControls();
-  stepAlgorithm();
+  // Kirim satu langkah saja ke worker
+  if (algoWorker) algoWorker.postMessage({ type: 'step' });
 }
 
 function stopSimulation() {
   isRunning = false; isPaused = false;
   clearTimeout(simulationTimer);
-  document.getElementById('btnPause').textContent = '⏸ Jeda';
+  if (algoWorker) {
+    algoWorker.onmessage = null;
+    algoWorker.onerror   = null;
+    algoWorker.terminate();
+    algoWorker = null;
+  }
+  document.getElementById('btnPause').textContent = '\u23f8 Jeda';
   document.getElementById('infoStatus').textContent = 'Berhenti';
   document.getElementById('infoStatus').style.color = 'var(--accent5)';
-  if (stepCount > 0) consoleLog('warn', `Simulasi dihentikan di langkah ${stepCount}`);
+  if (stepCount > 0) consoleLog('warn', 'Simulasi dihentikan di langkah ' + stepCount);
+  // Clear grid visualization
+  for (let r = 0; r < gridRows; r++)
+    for (let c = 0; c < gridCols; c++)
+      if (['visited', 'current', 'queued', 'path'].includes(grid[r][c])) {
+        grid[r][c] = 'unvisited'; updateCellUI(r, c);
+      }
+  resetStats();
   updateUIControls();
 }
 
@@ -1716,8 +1927,11 @@ function resetStats() {
   document.getElementById('infoFn').textContent = '-';
   document.getElementById('queueDisplay').innerHTML = '';
   document.getElementById('pathDisplay').innerHTML = '<span style="color:var(--text3);font-size:10px">Belum ada jalur</span>';
-  document.getElementById('infoStatus').textContent = 'Siap';
-  document.getElementById('infoStatus').style.color = 'var(--text3)';
+  const statusEl = document.getElementById('infoStatus');
+  statusEl.textContent = 'Siap';
+  statusEl.style.color = 'var(--text3)';
+  statusEl.style.background = 'transparent';
+  statusEl.style.borderColor = 'transparent';
 }
 
 function updateUIControls() {
@@ -1774,6 +1988,46 @@ function updateUIControls() {
 function updateSpeed(v) {
   const labels = ['Sangat Lambat', 'Lambat', 'Sedang', 'Cepat', 'Sangat Cepat'];
   document.getElementById('speedLabel').textContent = labels[v - 1];
+  if (algoWorker && isRunning) algoWorker.postMessage({ type: 'speed', value: parseInt(v) });
+}
+
+// ===================== TURBO MODE =====================
+function toggleTurboMode() {
+  isTurboMode = !isTurboMode;
+  _setTurboUI(isTurboMode);
+  if (algoWorker && isRunning) {
+    algoWorker.postMessage({ type: 'turbo', enabled: isTurboMode });
+  }
+  consoleLog('system', isTurboMode
+    ? '⚡ Turbo Mode ON — ribuan step per detik, batch flush ~60fps'
+    : '🔵 Normal Mode — Generator + Interval Ticking');
+}
+
+function _setTurboUI(active) {
+  const btn       = document.getElementById('btnTurbo');
+  const modeBadge = document.getElementById('modeBadge');
+  const tickBadge = document.getElementById('tickBadge');
+
+  if (btn) {
+    if (active) {
+      btn.classList.add('active');
+      btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> ⚡ Turbo ON`;
+      btn.title = 'Mode Turbo aktif — klik untuk mematikan';
+    } else {
+      btn.classList.remove('active');
+      btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> ⚡ Turbo Mode`;
+      btn.title = 'Aktifkan Turbo Mode untuk simulasi skala besar super cepat';
+    }
+  }
+
+  if (modeBadge) {
+    modeBadge.textContent = active ? '⚡ Generator' : '⚙ Generator';
+    modeBadge.className   = active ? 'gen-badge turbo' : 'gen-badge';
+  }
+  if (tickBadge) {
+    tickBadge.textContent = active ? 'Turbo Batch' : 'Interval Tick';
+    tickBadge.style.color = active ? 'var(--accent3)' : 'var(--text3)';
+  }
 }
 
 function updateHeuristic(v) {
@@ -1889,6 +2143,21 @@ function closeModal() {
 }
 
 // ===================== INIT =====================
+// ===================== THEME SWITCHING =====================
+function setTheme(theme, btn) {
+  // Remove all theme classes
+  document.body.classList.remove('theme-light', 'theme-warm');
+  // Add the selected theme class
+  if (theme === 'light') document.body.classList.add('theme-light');
+  else if (theme === 'warm') document.body.classList.add('theme-warm');
+  // Update button active states
+  document.querySelectorAll('.theme-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  // Update 3D colors if active
+  if (currentView === '3d') init3D();
+  consoleLog('system', `Tema diubah: ${theme === 'dark' ? 'Gelap' : theme === 'light' ? 'Terang' : 'Hangat'}`);
+}
+
 window.addEventListener('load', () => {
   initGrid(15, 20);
   consoleLog('system', '=== Simulasi Searching v2.0 dimuat ===');
@@ -2665,17 +2934,39 @@ function _stepCmp(side) {
     }
 
     case 'bidirectional': {
+      // Helper to reconstruct path on meeting
+      const biMeetPath = (meetKey) => {
+        // path from start → meeting point (via parentF)
+        const toMeet = [];
+        let cf = meetKey;
+        while (cf !== null && cf !== undefined) {
+          toMeet.unshift(cf);
+          cf = as.parentF.get(cf) ?? null;
+          if (cf === -1 || cf === undefined) break;
+        }
+        // path from meeting → goal (via parentB, reversed)
+        const fromMeet = [];
+        let cb = as.parentB.get(meetKey);
+        while (cb !== null && cb !== undefined) {
+          fromMeet.push(cb);
+          cb = as.parentB.get(cb) ?? null;
+          if (cb === -1 || cb === undefined) break;
+        }
+        return [...toMeet, ...fromMeet];
+      };
+
       if (as.dirF) {
-        if (!as.queueF.length) return noPFn();
+        if (!as.queueF.length) { as.dirF = false; return false; }
         const { r, c } = as.queueF.shift();
         const k = key(r, c);
         mC(r, c); mV(r, c);
         if (as.visB.has(k)) {
-          const merged = new Map();
-          let curF = k; while (as.parentF.has(curF)) { merged.set(curF, as.parentF.get(curF)); curF = as.parentF.get(curF); }
-          let curB = k; while (as.parentB.has(curB)) { merged.set(as.parentB.get(curB), curB); curB = as.parentB.get(curB); }
-          merged.set(key(cmpStartPos.r, cmpStartPos.c), -1);
-          return foundGoalFn(merged, goalP.r, goalP.c);
+          const path = biMeetPath(k);
+          // Build parent map from path for foundGoalFn
+          const pMap = new Map();
+          path.forEach((node, i) => { if (i > 0) pMap.set(node, path[i-1]); });
+          pMap.set(key(cmpStartPos.r, cmpStartPos.c), -1);
+          return foundGoalFn(pMap, goalP.r, goalP.c);
         }
         getN(r, c).forEach(n => {
           const nk = key(n.r, n.c);
@@ -2683,16 +2974,16 @@ function _stepCmp(side) {
         });
         as.dirF = false;
       } else {
-        if (!as.queueB.length) return noPFn();
+        if (!as.queueB.length) { as.dirF = true; return false; }
         const { r, c } = as.queueB.shift();
         const k = key(r, c);
         mC(r, c); mV(r, c);
         if (as.visF.has(k)) {
-          const merged = new Map();
-          let curF = k; while (as.parentF.has(curF)) { merged.set(curF, as.parentF.get(curF)); curF = as.parentF.get(curF); }
-          let curB = k; while (as.parentB.has(curB)) { merged.set(as.parentB.get(curB), curB); curB = as.parentB.get(curB); }
-          merged.set(key(cmpStartPos.r, cmpStartPos.c), -1);
-          return foundGoalFn(merged, goalP.r, goalP.c);
+          const path = biMeetPath(k);
+          const pMap = new Map();
+          path.forEach((node, i) => { if (i > 0) pMap.set(node, path[i-1]); });
+          pMap.set(key(cmpStartPos.r, cmpStartPos.c), -1);
+          return foundGoalFn(pMap, goalP.r, goalP.c);
         }
         getN(r, c).forEach(n => {
           const nk = key(n.r, n.c);
@@ -3039,6 +3330,8 @@ function _initCmpAlgo(algo, s, g) {
       as.visB = new Set([key(g.r, g.c)]);
       as.parentF = new Map();
       as.parentB = new Map();
+      as.parentF.set(key(s.r, s.c), null);
+      as.parentB.set(key(g.r, g.c), null);
       as.dirF = true;
       break;
     case 'ucs':
@@ -3205,3 +3498,20 @@ function setCmpGridSize(r, c, btn) {
 window.addEventListener('resize', () => {
   if (compareMode && cmpGrid.length) renderCompareGrids();
 });
+
+// ─── Theme-aware 3D color helper (override) ───────────────────────────
+function get3DColorThemed(state) {
+  const isLight = document.body.classList.contains('theme-light');
+  const isWarm  = document.body.classList.contains('theme-warm');
+  if (isLight) {
+    const c = { unvisited:'#dde4ef', wall:'#6d28d9', start:'#16a34a', goal:'#7c3aed',
+      visited:'#86efac', current:'#0284c7', queued:'#fbbf24', path:'#ea580c' };
+    return c[state] || c.unvisited;
+  }
+  if (isWarm) {
+    const c = { unvisited:'#2e2018', wall:'#7c2d12', start:'#22c55e', goal:'#f97316',
+      visited:'#064e3b', current:'#fbbf24', queued:'#92400e', path:'#84cc16' };
+    return c[state] || c.unvisited;
+  }
+  return get3DColor(state);
+}

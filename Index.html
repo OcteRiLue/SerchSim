@@ -28,6 +28,12 @@
     </div>
   </div>
   <div class="header-actions">
+    <!-- Theme Toggle -->
+    <div class="theme-toggle-group">
+      <button class="theme-btn active" id="themeDark" title="Dark" onclick="setTheme('dark',this)">🌙</button>
+      <button class="theme-btn" id="themeLight" title="Light" onclick="setTheme('light',this)">☀️</button>
+      <button class="theme-btn" id="themeWarm" title="Warm" onclick="setTheme('warm',this)">🍂</button>
+    </div>
     <button class="btn-header btn-compare-toggle" id="btnCompareToggle" onclick="toggleCompareMode()">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <rect x="2" y="3" width="9" height="18" rx="1"/><rect x="13" y="3" width="9" height="18" rx="1"/>
@@ -181,6 +187,10 @@
         <div class="stat-box"><div class="stat-val" id="statVisited">0</div><div class="stat-lbl">Dikunjungi</div></div>
         <div class="stat-box"><div class="stat-val" id="statQueue">0</div><div class="stat-lbl">Antrian</div></div>
         <div class="stat-box"><div class="stat-val" id="statPath" style="color:var(--node-path)">-</div><div class="stat-lbl">Path</div></div>
+        <div style="display:flex;flex-direction:column;justify-content:center;gap:3px;">
+          <span class="gen-badge" id="modeBadge">⚙ Generator</span>
+          <span style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;text-align:center" id="tickBadge">Interval Tick</span>
+        </div>
       </div>
       <div class="view-toggle" id="viewToggleNormal">
         <button class="view-btn active" onclick="setView('2d',this)">2D Grid</button>
@@ -210,14 +220,14 @@
           </div>
           <div id="graphView"><canvas id="graphCanvas"></canvas></div>
           <div class="legend">
-            <div class="legend-item"><div class="legend-dot" style="background:var(--bg2);border:1px solid #1a2a40"></div>Kosong</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#0f1923"></div>Dinding</div>
-            <div class="legend-item"><div class="legend-dot" style="background:var(--node-start)"></div>Start</div>
-            <div class="legend-item"><div class="legend-dot" style="background:var(--node-goal)"></div>Goal</div>
-            <div class="legend-item"><div class="legend-dot" style="background:rgba(16,185,129,0.4)"></div>Dikunjungi</div>
-            <div class="legend-item"><div class="legend-dot" style="background:var(--node-current)"></div>Sedang</div>
-            <div class="legend-item"><div class="legend-dot" style="background:rgba(245,158,11,0.4)"></div>Antrian</div>
-            <div class="legend-item"><div class="legend-dot" style="background:var(--node-path)"></div>Path</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--cell-empty-bg);border:1px solid var(--cell-empty-border)"></div>Kosong</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--node-wall);border:1px solid var(--node-wall-border)"></div>Dinding</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--node-start);box-shadow:0 0 5px var(--node-start-glow)"></div>Start</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--node-goal);box-shadow:0 0 5px var(--node-goal-glow)"></div>Goal</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--cell-visited-bg);border:1px solid var(--cell-visited-border)"></div>Dikunjungi</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--node-current);box-shadow:0 0 5px var(--node-current-glow)"></div>Sedang</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--cell-queued-bg);border:1px solid var(--cell-queued-border)"></div>Antrian</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--node-path);box-shadow:0 0 5px var(--node-path-glow)"></div>Path</div>
           </div>
           <div class="canvas-toolbar">
             <button class="tool-btn active" id="toolWall" onclick="setTool('wall',this)">🧱 Dinding</button>
@@ -241,7 +251,7 @@
             </div>
             <div class="legend compare-legend">
               <div class="legend-item"><div class="legend-dot" style="background:var(--bg2);border:1px solid #1a2a40"></div>Kosong</div>
-              <div class="legend-item"><div class="legend-dot" style="background:#0f1923"></div>Dinding</div>
+              <div class="legend-item"><div class="legend-dot" style="background:var(--node-wall);border:1px solid var(--node-wall-border)"></div>Dinding</div>
               <div class="legend-item"><div class="legend-dot" style="background:var(--node-start)"></div>Start</div>
               <div class="legend-item"><div class="legend-dot" style="background:var(--node-goal)"></div>Goal</div>
               <div class="legend-item"><div class="legend-dot" style="background:rgba(16,185,129,0.4)"></div>Dikunjungi</div>
@@ -260,7 +270,7 @@
             </div>
             <div class="legend compare-legend">
               <div class="legend-item"><div class="legend-dot" style="background:var(--bg2);border:1px solid #1a2a40"></div>Kosong</div>
-              <div class="legend-item"><div class="legend-dot" style="background:#0f1923"></div>Dinding</div>
+              <div class="legend-item"><div class="legend-dot" style="background:var(--node-wall);border:1px solid var(--node-wall-border)"></div>Dinding</div>
               <div class="legend-item"><div class="legend-dot" style="background:var(--node-start)"></div>Start</div>
               <div class="legend-item"><div class="legend-dot" style="background:var(--node-goal)"></div>Goal</div>
               <div class="legend-item"><div class="legend-dot" style="background:rgba(16,185,129,0.4)"></div>Dikunjungi</div>
@@ -313,6 +323,12 @@
             <div class="ctrl-row">
               <button class="btn-ctrl btn-pause" id="btnPause" onclick="pauseSimulation()">⏸ Jeda</button>
               <button class="btn-ctrl btn-stop" id="btnStop" onclick="stopSimulation()">⏹ Berhenti</button>
+            </div>
+            <div class="ctrl-row">
+              <button class="btn-ctrl btn-turbo" id="btnTurbo" onclick="toggleTurboMode()" title="Turbo: Web Worker tanpa delay, batch flush ~60fps" style="flex:1;gap:5px">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                ⚡ Turbo Mode
+              </button>
             </div>
             <div class="slider-row">
               <div class="slider-label"><span>Kecepatan</span><span id="speedLabel">Sedang</span></div>
