@@ -137,9 +137,9 @@ function handleStop() {
 
 function handleStep() {
   // Manual step-through: konsumsi satu yield dari generator
-  if (!algoGenerator || isPaused) return;
+  if (!algoGenerator) return;
   const result = algoGenerator.next();
-  if (result.done) {
+  if (result.done || result.value === 'DONE') {
     isRunning = false;
   }
   flush();
