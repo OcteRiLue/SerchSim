@@ -2108,6 +2108,19 @@ function updateUIControls() {
 
   const isLockedAlgo = (currentAlgo === 'ids' || currentAlgo === 'simulated_annealing');
 
+  const speedSlider = document.getElementById('speedSlider');
+  if (speedSlider) {
+    if (isLockedAlgo) {
+      speedSlider.max = "3";
+      if (parseInt(speedSlider.value) > 3) {
+        speedSlider.value = "3";
+        updateSpeed(3);
+      }
+    } else {
+      speedSlider.max = "5";
+    }
+  }
+
   if (!isRunning) {
     if (startBtn) startBtn.disabled = false;
     if (stepBtn) stepBtn.disabled = false;
@@ -2272,10 +2285,28 @@ function handleConsoleInput(e) {
       } else consoleLog('error', 'Algo tidak ditemukan. Coba: bfs, dfs, astar, ucs, greedy ...');
       break;
     case 'speed':
-      if (parts[1]) { document.getElementById('speedSlider').value = parts[1]; updateSpeed(parts[1]); }
+      if (parts[1]) {
+        let val = parseInt(parts[1]);
+        const isLockedAlgo = (currentAlgo === 'ids' || currentAlgo === 'simulated_annealing');
+        if (isLockedAlgo && val > 3) {
+          consoleLog('warn', 'Kecepatan dibatasi maksimal 3 (Sedang) untuk algoritma ini.');
+          val = 3;
+        }
+        document.getElementById('speedSlider').value = val;
+        updateSpeed(val);
+      }
       break;
     case 'grid':
-      if (parts[1] && parts[2]) setGridSize(parseInt(parts[1]), parseInt(parts[2]), document.querySelector('.grid-size-btn'));
+      if (parts[1] && parts[2]) {
+        const isLockedAlgo = (currentAlgo === 'ids' || currentAlgo === 'simulated_annealing');
+        const r = parseInt(parts[1]);
+        const c = parseInt(parts[2]);
+        if (isLockedAlgo && (r !== 10 || c !== 10)) {
+          consoleLog('error', 'Ukuran grid dikunci ke 10x10 untuk algoritma ini!');
+        } else {
+          setGridSize(r, c, document.querySelector('.grid-size-btn'));
+        }
+      }
       break;
     case 'version':
       consoleLog('system', 'Simulasi Searching v2.0 | AI Visualization Lab | 2024');
@@ -2435,6 +2466,31 @@ function onCompareAlgoChange() {
   document.getElementById('compareGridTitleB').textContent = ALGO_INFO[algoB]?.title || algoB;
   document.getElementById('scoreAlgoNameA').textContent = ALGO_INFO[algoA]?.title || algoA;
   document.getElementById('scoreAlgoNameB').textContent = ALGO_INFO[algoB]?.title || algoB;
+
+  const isCmpLocked = (algoA === 'ids' || algoA === 'simulated_annealing' || algoB === 'ids' || algoB === 'simulated_annealing');
+  const cmpSizeBtns = document.querySelectorAll('.cmp-size-btn');
+  if (isCmpLocked) {
+    if (cmpRows !== 10 || cmpCols !== 10) {
+      setCmpGridSize(10, 10, cmpSizeBtns[0]);
+    }
+    cmpSizeBtns.forEach(btn => btn.disabled = true);
+    const speedSlider = document.getElementById('compareSpeedSlider');
+    if (speedSlider) {
+      speedSlider.max = "3";
+      if (parseInt(speedSlider.value) > 3) {
+        speedSlider.value = "3";
+        updateCompareSpeed(3);
+      }
+    }
+  } else {
+    if (!cmpState.A.running && !cmpState.B.running) {
+      cmpSizeBtns.forEach(btn => btn.disabled = false);
+    }
+    const speedSlider = document.getElementById('compareSpeedSlider');
+    if (speedSlider) {
+      speedSlider.max = "5";
+    }
+  }
 }
 
 // ----- Grid init / render -----
@@ -3657,6 +3713,7 @@ function _finishCompare() {
   document.querySelectorAll('#compareToolbar button').forEach(b => b.disabled = false);
 
   _updateCmpScoreboard('A'); _updateCmpScoreboard('B');
+  onCompareAlgoChange();
   consoleLog('success', `Komparasi selesai! ${A.algo}: ${A.steps} steps | ${B.algo}: ${B.steps} steps`);
 }
 
@@ -3691,6 +3748,7 @@ function stopCompare() {
   document.getElementById('compareAlgoB').disabled = false;
   document.querySelectorAll('.cmp-size-btn').forEach(b => b.disabled = false);
   document.querySelectorAll('#compareToolbar button').forEach(b => b.disabled = false);
+  onCompareAlgoChange();
   updateCmpStatus('A', 'ready'); updateCmpStatus('B', 'ready');
   consoleLog('warn', 'Komparasi dihentikan');
 }
